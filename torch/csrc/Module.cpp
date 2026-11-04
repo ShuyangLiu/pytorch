@@ -2880,6 +2880,23 @@ Call this whenever a new thread is created in order to propagate values from
     fake.unsafeGetTensorImpl()->set_real_tensor(nullptr);
   });
 
+  // The real tensor's dispatch keys a C++ fake stands for (Python
+  // FakeTensor.dispatch_keys).
+  py_module.def(
+      "_set_fake_dispatch_keys",
+      [](const at::Tensor& fake, std::optional<c10::DispatchKeySet> keys) {
+        fake.unsafeGetTensorImpl()->set_fake_dispatch_keys(keys);
+      },
+      py::arg("fake"),
+      py::arg("keys"));
+
+  py_module.def(
+      "_get_fake_dispatch_keys",
+      [](const at::Tensor& fake) {
+        return fake.unsafeGetTensorImpl()->fake_dispatch_keys();
+      },
+      py::arg("fake"));
+
   py_module.def(
       "_set_fake_sym_memo",
       [](const at::Tensor& fake,
