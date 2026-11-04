@@ -20990,6 +20990,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         actual = torch.compile(fn)(torch.zeros(1, device=self.device))
         self.assertEqual(expected, actual)
 
+    def test_clones_of_one_tensor_output_distinct(self):
+        # remove_noop_ops may drop one of these clones, but not both, or the
+        # two outputs collapse into one tensor object while eager returns two.
+        def fn(x):
+            base = x + 1
+            return base.clone(), base.view(-1).clone()
+
+        a, b = torch.compile(fn)(torch.zeros(1, device=self.device))
+        self.assertIsNot(a, b)
+        self.assertNotEqual(a.data_ptr(), b.data_ptr())
+
     def test_no_op_view_output_identity(self):
         # https://github.com/pytorch/pytorch/issues/191449
         # A no-op view returned alongside its base must stay a distinct

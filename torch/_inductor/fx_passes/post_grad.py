@@ -1673,6 +1673,10 @@ def remove_noop_ops(graph: torch.fx.Graph):
             ) and cond(*args, **kwargs):
                 node.replace_all_uses_with(src)
                 graph.erase_node(node)
+                # src now backs an output, so a later copy of src into another
+                # output must stay a copy or both outputs become one tensor.
+                if node_storage in output_storages:
+                    output_storages.add(src_storage)
 
 
 # We can potentially generalize to arbitrary view ops by validating
