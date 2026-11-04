@@ -246,7 +246,8 @@ struct C10_API FakeTensorMode {
   // Owns a Python weakref to this mode's Python wrapper (CppFakeTensorMode),
   // not the wrapper itself. See
   // Note [C++ FakeTensorMode Python wrapper lifetime] in
-  // torch/csrc/FakeTensorMode.cpp.
+  // torch/csrc/FakeTensorMode.cpp. Set when the mode is created; after that
+  // only getCppFakeTensorModePyObj accesses it, under a lock.
   std::shared_ptr<c10::SafePyObject> fake_mode_pyobj_;
 
   // when false, disallow a fake tensor from having a 'meta' device. Atomic, as
@@ -264,6 +265,10 @@ struct C10_API FakeTensorMode {
   // Python's _allow_unsafe_data_ptr_access, exposed under that name. Atomic,
   // like allow_meta_.
   std::atomic<bool> allow_unsafe_data_ptr_access_{true};
+
+  // Same as Python's FakeTensorMode.epoch. Kept here rather than on the Python
+  // wrapper, so a rebuilt wrapper sees it. Atomic, like allow_meta_.
+  std::atomic<uint64_t> epoch_{0};
 
   FakeTensorMode(
       std::shared_ptr<c10::SafePyObject> shape_env,

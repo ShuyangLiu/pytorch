@@ -3045,6 +3045,29 @@ Call this whenever a new thread is created in order to propagate values from
           },
           [](c10::FakeTensorMode& mode, bool value) {
             mode.allow_unsafe_data_ptr_access_.store(value);
+          })
+      .def_property(
+          "epoch",
+          [](const c10::FakeTensorMode& mode) { return mode.epoch_.load(); },
+          [](c10::FakeTensorMode& mode, uint64_t value) {
+            mode.epoch_.store(value);
+          })
+      .def_property_readonly(
+          "fake_tensor_converter",
+          [](const c10::FakeTensorMode& mode) -> py::object {
+            if (!mode.fake_tensor_converter_) {
+              return py::none();
+            }
+            return py::reinterpret_borrow<py::object>(
+                mode.fake_tensor_converter_->ptr(getPyInterpreter()));
+          })
+      .def_property_readonly(
+          "shape_env", [](const c10::FakeTensorMode& mode) -> py::object {
+            if (!mode.shape_env_) {
+              return py::none();
+            }
+            return py::reinterpret_borrow<py::object>(
+                mode.shape_env_->ptr(getPyInterpreter()));
           });
 
   // The C++ counterpart of Python's FakeTensorConverter.from_meta_and_device.
@@ -3103,8 +3126,7 @@ Call this whenever a new thread is created in order to propagate values from
   // including a Python FakeTensor (maybe_get_fake_mode handles those). Unlike
   // maybe_get_fake_mode, it does not look inside functional, functorch or
   // traceable wrapper tensors. If the wrapper has been collected,
-  // getCppFakeTensorModePyObj rebuilds it, which raises until
-  // CppFakeTensorMode exists (a later PR in this stack).
+  // getCppFakeTensorModePyObj rebuilds it.
   py_module.def("_maybe_get_fake_mode", [](const at::Tensor& t) -> py::object {
     if (!t.defined() || !t.is_fake()) {
       return py::none();
