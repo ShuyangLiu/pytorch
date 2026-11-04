@@ -289,6 +289,68 @@ TEST(TestNative, AsStridedPreservesFakeTensorMetadata) {
   EXPECT_EQ(result_impl->fake_tensor_mode(), mode);
 }
 
+TEST(TestNative, MarkFakeStorage) {
+  auto mode = std::make_shared<c10::FakeTensorMode>(nullptr, nullptr);
+  auto make_fake = [&]() {
+    auto t = at::empty({2}, at::device(at::kMeta));
+    at::init_cpp_fake(t.unsafeGetTensorImpl(), c10::Device(c10::kCPU), mode);
+    EXPECT_EQ(t.unsafeGetTensorImpl()->fake_tensor_mode(), mode);
+    EXPECT_EQ(t.device(), c10::Device(c10::kCPU));
+    return t;
+  };
+  auto expect_throws = [](const at::Tensor& t) {
+    try {
+      t.mutable_data_ptr();
+      ADD_FAILURE() << "expected mutable_data_ptr() to throw";
+    } catch (const c10::Error& e) {
+      EXPECT_NE(
+          std::string(e.what()).find(
+              "Cannot access data pointer of Tensor (e.g. FakeTensor"),
+          std::string::npos);
+    }
+  };
+  struct CaptureWarnings : c10::WarningHandler {
+    std::vector<std::string> messages;
+    void process(const c10::Warning& warning) override {
+      messages.push_back(warning.msg());
+    }
+  };
+  CaptureWarnings handler;
+  c10::WarningUtils::WarningHandlerGuard handler_guard(&handler);
+  c10::WarningUtils::WarnAlways warn_always;
+
+  auto expect_warns = [&](const at::Tensor& t) {
+    auto count = handler.messages.size();
+    t.mutable_data_ptr();
+    ASSERT_EQ(handler.messages.size(), count + 1);
+    const auto& msg = handler.messages.back();
+    EXPECT_NE(
+        msg.find("Accessing the data pointer of FakeTensor"),
+        std::string::npos);
+  };
+
+  // Reading the data pointer of a fake of a default mode warns
+  auto fake = make_fake();
+  expect_warns(fake);
+
+  // Disallowing unsafe access makes fakes made afterwards throw. A view made
+  // within a kernel does not mark the shared storage again, but a new fake of
+  // it, as the fake fallback makes for a view op's output, does.
+  mode->allow_unsafe_data_ptr_access_ = false;
+  expect_throws(make_fake());
+  expect_warns(fake);
+  expect_warns(at::native::as_strided_tensorimpl(fake, {1}, {1}));
+  auto alias = at::empty({0}, at::device(at::kMeta));
+  alias.unsafeGetTensorImpl()->set_storage_keep_dtype(fake.storage());
+  at::init_cpp_fake(alias.unsafeGetTensorImpl(), c10::Device(c10::kCPU), mode);
+  expect_throws(fake);
+  auto real = at::empty({2});
+  EXPECT_THROW(
+      at::init_cpp_fake(real.unsafeGetTensorImpl(), c10::Device(c10::kCPU), mode),
+      c10::Error);
+  EXPECT_FALSE(real.is_fake());
+}
+
 TEST(TestNative, InKernelInvocationReportsMetaDevice) {
   auto t = at::empty({2}, at::device(at::kMeta));
   at::set_and_normalize_fake_device(

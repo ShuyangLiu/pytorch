@@ -2964,6 +2964,10 @@ Call this whenever a new thread is created in order to propagate values from
                 std::make_shared<c10::SafePyObject>(
                     converter.inc_ref().ptr(), getPyInterpreter()),
                 functorch_config.attr("fake_tensor_allow_meta").cast<bool>());
+            mode->allow_unsafe_data_ptr_access_ =
+                functorch_config
+                    .attr("fake_tensor_allow_unsafe_data_ptr_access")
+                    .cast<bool>();
             PyObject* weakref = PyWeakref_NewRef(wrapper.ptr(), nullptr);
             if (weakref == nullptr) {
               throw py::error_already_set();
@@ -2980,6 +2984,14 @@ Call this whenever a new thread is created in order to propagate values from
           [](const c10::FakeTensorMode& mode) { return mode.allow_meta_.load(); },
           [](c10::FakeTensorMode& mode, bool value) {
             mode.allow_meta_.store(value);
+          })
+      .def_property(
+          "_allow_unsafe_data_ptr_access",
+          [](const c10::FakeTensorMode& mode) {
+            return mode.allow_unsafe_data_ptr_access_.load();
+          },
+          [](c10::FakeTensorMode& mode, bool value) {
+            mode.allow_unsafe_data_ptr_access_.store(value);
           });
 
   py_module.def("_storage_Use_Count", [](size_t storage_impl_ptr) {

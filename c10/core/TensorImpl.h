@@ -259,6 +259,12 @@ struct C10_API FakeTensorMode {
   // so read this through PyInterpreterVTable::allow_non_fake_inputs().
   bool allow_non_fake_inputs_ = false;
 
+  // Whether reading the mutable data pointer of a fake made afterwards only
+  // warns (true) or throws (false); a storage's marking is never relaxed.
+  // Python's _allow_unsafe_data_ptr_access, exposed under that name. Atomic,
+  // like allow_meta_.
+  std::atomic<bool> allow_unsafe_data_ptr_access_{true};
+
   FakeTensorMode(
       std::shared_ptr<c10::SafePyObject> shape_env,
       std::shared_ptr<c10::SafePyObject> converter,
