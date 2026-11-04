@@ -73,6 +73,19 @@ namespace torch::aot_inductor::detail {
   }
 #endif
 
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_13_0
+namespace torch::aot_inductor {
+// For destructors, which log errors instead of throwing; like
+// AOTI_TORCH_ERROR_CODE_CHECK_WITH_MESSAGE, it calls a libtorch function.
+inline void log_shim_error(AOTITorchError error, const char* what) {
+  if (error != AOTI_TORCH_SUCCESS) {
+    std::cerr << "AOTInductor: " << what << ": "
+              << torch_exception_get_what_without_backtrace() << '\n';
+  }
+}
+} // namespace torch::aot_inductor
+#endif
+
 using AOTIRuntimeError = int32_t;
 #define AOTI_RUNTIME_SUCCESS 0
 #define AOTI_RUNTIME_FAILURE 1
