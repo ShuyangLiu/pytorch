@@ -5584,6 +5584,23 @@ class TestCppFakeTensorModeBindings(TestCase):
             torch._C._from_meta_and_device(inference, torch.device("cpu"), mode)
         inference.data_ptr()
 
+    def test_maybe_get_fake_mode(self):
+        mode, wrapper = self._make_mode()
+        other_mode, other_wrapper = self._make_mode()
+        meta = torch.empty(2, device="meta")
+        fake = torch._C._from_meta_and_device(meta, torch.device("cpu"), mode)
+        other = torch._C._from_meta_and_device(meta, torch.device("cpu"), other_mode)
+        self.assertIs(torch._C._maybe_get_fake_mode(fake), wrapper)
+        self.assertIs(torch._C._maybe_get_fake_mode(other), other_wrapper)
+        self.assertIsNone(torch._C._maybe_get_fake_mode(meta))
+        self.assertIsNone(torch._C._maybe_get_fake_mode(torch.empty(2)))
+        no_mode = torch.empty(2, device="meta")
+        torch._C._set_fake_device(no_mode, torch.device("cpu"))
+        self.assertIsNone(torch._C._maybe_get_fake_mode(no_mode))
+        # The functional wrapper copies the fake's mode but drops the Fake key
+        functional = torch._to_functional_tensor(fake)
+        self.assertIsNone(torch._C._maybe_get_fake_mode(functional))
+
     def test_unsafe_data_ptr_access(self):
         def make_fake(mode):
             meta = torch.empty(2, device="meta")
