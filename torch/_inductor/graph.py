@@ -425,6 +425,8 @@ class GraphLowering(torch.fx.Interpreter):
         get_decomp_fn: Callable[..., dict[Any, Callable[..., Any]]] | None = None,
         split_into_partitions: bool | None = None,
         cudagraphs_per_partition: bool | None = None,
+        cudagraphs_top_level: bool | None = None,
+        cudagraph_region_forced_partition: bool = False,
     ) -> None:
         super().__init__(gm)
         self.get_decomp_fn = get_decomp_fn
@@ -605,8 +607,9 @@ class GraphLowering(torch.fx.Interpreter):
         # Used if lowering encounters cases where cudagraphs are not supported
         self.disable_cudagraphs_reason: str | None = None
         self.kernel_free_cudagraph: bool = False
-        # Whether codegen splits this graph into partition functions. Codegen and
-        # post-compile cudagraph wrapping read this instead of
+        # Whether codegen splits this graph into partition functions; post-compile
+        # cudagraph wrapping follows it too. A nested region asking for its own
+        # CUDA Graph forces this on for one compile, so it can differ from
         # config.graph_partition, which stays at what the user asked for and is
         # still read by ConstructorMoverPass, the cpp_wrapper setup and the
         # scheduler's partition-minimizing reorder.
@@ -629,6 +632,13 @@ class GraphLowering(torch.fx.Interpreter):
                 "cudagraphs_per_partition=True requires split_into_partitions=True"
             )
         self.cudagraphs_per_partition = cudagraphs_per_partition
+        # Effective cudagraph setting outside of any nested region.
+        self.cudagraphs_top_level = (
+            config.triton.cudagraphs
+            if cudagraphs_top_level is None
+            else cudagraphs_top_level
+        )
+        self.cudagraph_region_forced_partition = cudagraph_region_forced_partition
 
         # only keeping one node per device for stack trace purposes
         self.device_node_mapping: dict[torch.device, torch.fx.Node] = {}
@@ -1038,6 +1048,19 @@ class GraphLowering(torch.fx.Interpreter):
             name=self.qualify_name(subgraph_name),
             split_into_partitions=False,
             cudagraphs_per_partition=False,
+        )
+
+    @property
+    def partition_handles_cudagraph_unsafe_ops(self) -> bool:
+        """
+        Whether an op that cannot be CUDA Graph captured gets split into its own
+        partition rather than disabling capture for the whole graph. This is
+        cudagraphs_per_partition, except when partitioning was forced on only to
+        isolate a nested region while the enclosing code is still captured: the
+        enclosing capture keeps following the user's graph_partition=False rules.
+        """
+        return self.cudagraphs_per_partition and not (
+            self.cudagraph_region_forced_partition and self.cudagraphs_top_level
         )
 
     def find_nodes_prefer_channels_last(self) -> OrderedSet[Node]:
