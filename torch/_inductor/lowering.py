@@ -357,12 +357,22 @@ def maybe_copy_cpu_scalar(x: TensorBox, device: torch.device) -> TensorBox:
     """
     Copy cpu scalar if doesn't not match with given `device`
     """
-    if not isinstance(x.data, ir.ReinterpretView) or has_free_unbacked_symbols(
-        x.get_size()
-    ):
+    cur_device = x.get_device()
+    if not isinstance(x.data, ir.ReinterpretView):
+        if (
+            cur_device is not None
+            and cur_device.type == "cpu"
+            and device.type != "cpu"
+            and len(x.get_size()) == 0
+        ) and any(
+            V.graph.get_buffer(name).get_size() != [] for name in x.get_read_names()
+        ):
+            # GPU codegen passes zero-dimensional CPU buffers by value.
+            return ir.ExternKernel.copy_input(x)
+        return x
+    if has_free_unbacked_symbols(x.get_size()):
         return x
     size = V.graph.sizevars.guarding_hints_or_throw(x.get_size())
-    cur_device = x.get_device()
     if (
         cur_device is not None
         and cur_device.type == "cpu"
@@ -410,6 +420,13 @@ def transform_args(
         device = (
             args[args_indices[0]] if args_indices else kwargs[kwargs_indices[0]]
         ).get_device()
+        for arg in itertools.chain(
+            (args[i] for i in args_indices), (kwargs[k] for k in kwargs_indices)
+        ):
+            arg_device = arg.get_device()
+            if arg_device is not None and is_gpu(arg_device.type):
+                device = arg_device
+                break
 
         for i in args_indices:
             args[i] = maybe_copy_cpu_scalar(args[i], device)

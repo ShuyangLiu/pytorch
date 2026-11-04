@@ -19949,6 +19949,71 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
 
     @requires_gpu_and_triton
+    @parametrize("gpu_first", [False, True])
+    @parametrize("scalar_math", [False, True])
+    def test_cpu_squeezed_singleton_with_gpu_tensor(self, gpu_first, scalar_math):
+        def fn(x, lr):
+            scalar = lr.to(torch.float32).squeeze()
+            if scalar_math:
+                scalar = (1.0 - scalar) * 2.5
+            return x * scalar if gpu_first else scalar * x
+
+        x = torch.rand(20, device=GPU_TYPE)
+        lr = torch.tensor([0.005], dtype=torch.float64)
+
+        eager = fn(x, lr)
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)(x, lr)
+        self.assertEqual(eager, compiled)
+
+    @requires_gpu_and_triton
+    @parametrize("gpu_first", [False, True])
+    def test_cpu_scalar_expression_with_gpu_tensor(self, gpu_first):
+        def fn(x, lr):
+            scalar = (1.0 - lr.to(torch.float32)) * 2.5
+            return x * scalar if gpu_first else scalar * x
+
+        x = torch.rand(20, device=GPU_TYPE)
+        lr = torch.tensor(0.005, dtype=torch.float64)
+
+        torch._inductor.metrics.generated_kernel_count = 0
+        eager = fn(x, lr)
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True)(x, lr)
+        self.assertEqual(eager, compiled)
+        self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
+
+    @requires_gpu_and_triton
+    @parametrize("gpu_first", [False, True])
+    @parametrize("scalar_math", [False, True])
+    @config.patch(implicit_fallbacks=True)
+    def test_opaque_cpu_squeezed_singleton_with_gpu_tensor(
+        self, gpu_first, scalar_math
+    ):
+        with _scoped_library("inductor_cpu_scalar", "FRAGMENT") as lib:
+            lib.define("opaque(Tensor x) -> Tensor")
+
+            @torch.library.impl(lib, "opaque", "CPU")
+            def opaque(x):
+                return x.clone()
+
+            @torch.library.impl(lib, "opaque", "Meta")
+            def opaque_meta(x):
+                return torch.empty_like(x)
+
+            def fn(x, lr):
+                scalar = torch.ops.inductor_cpu_scalar.opaque.default(lr)
+                scalar = scalar.to(torch.float32).squeeze()
+                if scalar_math:
+                    scalar = (1.0 - scalar) * 2.5
+                return x * scalar if gpu_first else scalar * x
+
+            x = torch.rand(20, device=GPU_TYPE)
+            lr = torch.tensor([0.005], dtype=torch.float64)
+
+            eager = fn(x, lr)
+            compiled = torch.compile(fn, backend="inductor", fullgraph=True)(x, lr)
+            self.assertEqual(eager, compiled)
+
+    @requires_gpu_and_triton
     @torch._inductor.config.patch(cpp_wrapper=True)
     def test_cpu_scalar_with_gpu_tensor_cpp(self):
         def fn(a, b):
