@@ -2994,6 +2994,58 @@ Call this whenever a new thread is created in order to propagate values from
             mode.allow_unsafe_data_ptr_access_.store(value);
           });
 
+  // The C++ counterpart of Python's FakeTensorConverter.from_meta_and_device.
+  // It takes no pytype or dispatch_keys: a C++ fake is always a plain Tensor
+  // (a Parameter carries the _is_param marker instead), and callers record
+  // anything else on the result. It does not memoize; callers such as the
+  // converter do.
+  py_module.def(
+      "_from_meta_and_device",
+      [](const at::Tensor& meta,
+         c10::Device device,
+         const std::shared_ptr<c10::FakeTensorMode>& mode) {
+        // A functional or functorch wrapper would be copied as a wrapper whose
+        // inner tensor is not fake. Checked first, as reading a subclass's
+        // device can run its __torch_dispatch__.
+        constexpr auto wrapper_ks = c10::python_ks |
+            c10::DispatchKeySet(c10::DispatchKey::Functionalize) |
+            c10::functorch_transforms_ks |
+            c10::DispatchKeySet(c10::DispatchKey::BatchedNestedTensor);
+        TORCH_CHECK_TYPE(
+            !meta.key_set().has_any(wrapper_ks),
+            "_from_meta_and_device does not accept tensor subclasses with "
+            "__torch_dispatch__ or functional or functorch wrappers, got "
+            "dispatch keys ",
+            meta.key_set());
+        TORCH_CHECK_VALUE(
+            meta.is_meta(),
+            "tensor's device must be 'meta', got ",
+            meta.device().type());
+        auto* impl = meta.unsafeGetTensorImpl();
+        // A fake also reads as meta on the meta device or inside a kernel
+        TORCH_CHECK_VALUE(
+            !impl->is_fake(), "Expected a meta tensor that is not fake");
+        // Like Python's FakeTensor(mode, meta, device), which goes through
+        // _make_subclass: a new detached fake sharing meta's storage, made
+        // without dispatching. meta keeps its own device and autograd state;
+        // as in Python, the storage it shares is marked as a fake's.
+        c10::intrusive_ptr<c10::TensorImpl> out_impl;
+        {
+          // Otherwise an active dispatch mode would run the detach
+          c10::impl::ExcludeDispatchKeyGuard no_python(
+              c10::DispatchKey::Python);
+          out_impl = impl->shallow_copy_and_detach(
+              impl->version_counter(), /*allow_tensor_metadata_change=*/true);
+        }
+        // Before marking the shared storage, as this can throw
+        out_impl->set_requires_grad(meta.requires_grad());
+        at::init_cpp_fake(out_impl.get(), device, mode);
+        return at::Tensor(std::move(out_impl));
+      },
+      py::arg("meta"),
+      py::arg("device"),
+      py::arg("mode").none(false));
+
   py_module.def("_storage_Use_Count", [](size_t storage_impl_ptr) {
     // NOLINTNEXTLINE(performance-no-int-to-ptr)
     c10::StorageImpl* storage_impl = (c10::StorageImpl*)storage_impl_ptr;
