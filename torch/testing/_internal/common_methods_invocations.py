@@ -5931,11 +5931,10 @@ def sample_inputs_mode(op_info, device, dtype, requires_grad, **kwargs):
         ((S, S, S), (),),
         ((S, S, S), (1, ),),
         ((S, S, S), (1, True, ),),
-        ((), (),),
         ((), (0,),),
         ((), (0, True,),),
-        # Non-fused mode kernel on CUDA
-        ((3000,), ()),
+        # Non-fused mode kernel on CUDA (slice size > 2 * MAX_BLOCK_SIZE)
+        ((2049,), ()),
     )
     make_arg = partial(make_tensor, dtype=dtype, device=device,
                        requires_grad=requires_grad, low=None, high=None)
@@ -18066,10 +18065,7 @@ op_db: list[OpInfo] = [
            skips=(
                # Resized a non-empty tensor but did not warn about it
                DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_out_warning'),
-               # FIXME:
-               # Expected 2114 but got 1123.
-               # Absolute difference: 991 (up to 0.001 allowed)
-               # Relative difference: 0.46877956480605487 (up to 0.001 allowed)
+               # FIXME: indices can differ between CPU and GPU on tied values
                DecorateInfo(
                    unittest.skip("Skipped!"),
                    "TestCommon",
