@@ -5729,6 +5729,66 @@ class TestCppFakeTensorModeBindings(TestCase):
             torch._C._unset_dispatch_mode(torch._C._TorchDispatchModeKey.FAKE)
         self.assertEqual(self._installed(), (None, False))
 
+    def test_item_memo(self):
+        mode, _ = self._make_mode()
+
+        def make_fake():
+            meta = torch.empty((), device="meta")
+            return torch._C._from_meta_and_device(meta, torch.device("cpu"), mode)
+
+        fake = make_fake()
+        self.assertIsNone(torch._C._get_fake_item_memo(fake, 0))
+        with self.assertRaisesRegex(RuntimeError, "Expected a fake tensor"):
+            torch._C._set_fake_item_memo(torch.empty(()), 2, None)
+        for bad in (fake, (fake,), None):
+            with self.assertRaisesRegex(TypeError, "number or SymNumber"):
+                torch._C._set_fake_item_memo(fake, bad, None)
+        memo = ShapeEnv().create_unbacked_symfloat()
+        torch._C._set_fake_item_memo(fake, memo, 3)
+        self.assertIs(torch._C._get_fake_item_memo(fake, 3), memo)
+        self.assertIs(torch._C._get_fake_item_memo(fake, 3), memo)
+        # Dropped once read in another epoch, unless kept across epochs
+        self.assertIsNone(torch._C._get_fake_item_memo(fake, 4))
+        self.assertIsNone(torch._C._get_fake_item_memo(fake, 3))
+        torch._C._set_fake_item_memo(fake, True, None)
+        self.assertIs(torch._C._get_fake_item_memo(fake, 4), True)
+        self.assertIs(torch._C._get_fake_item_memo(fake, 5), True)
+        # Dropped once the tensor is mutated, whether or not it has an epoch
+        for epoch in (5, None):
+            torch._C._set_fake_item_memo(fake, 2, epoch)
+            self.assertEqual(torch._C._get_fake_item_memo(fake, 5), 2)
+            bumped = (fake._version + 1,)
+            torch._C._autograd._unsafe_set_version_counter((fake,), bumped)
+            self.assertIsNone(torch._C._get_fake_item_memo(fake, 5))
+        # An inference fake has no version counter to record or check, but its
+        # epochs are checked as usual
+        with torch.inference_mode():
+            inference = make_fake()
+        self.assertTrue(inference.is_inference())
+        torch._C._set_fake_item_memo(inference, 2, 5)
+        self.assertEqual(torch._C._get_fake_item_memo(inference, 5), 2)
+        self.assertIsNone(torch._C._get_fake_item_memo(inference, 6))
+        torch._C._set_fake_item_memo(inference, 3, None)
+        self.assertEqual(torch._C._get_fake_item_memo(inference, 6), 3)
+        self.assertEqual(torch._C._get_fake_item_memo(inference, 7), 3)
+        # A set that fails, here as set_data disabled the version counter,
+        # leaves no memo behind
+        with torch.inference_mode():
+            disabled = make_fake()
+        disabled.data = make_fake()
+        with self.assertRaisesRegex(RuntimeError, "version counter"):
+            torch._C._set_fake_item_memo(disabled, 2, 5)
+        self.assertIsNone(torch._C._get_fake_item_memo(disabled, 5))
+        # A shallow copy (set_data) drops the memo and does not copy the source's.
+        # Both are at version 0, so a copied memo would not read as mutated.
+        dst, src = make_fake(), make_fake()
+        torch._C._set_fake_item_memo(dst, 2, None)
+        torch._C._set_fake_item_memo(src, 3, None)
+        self.assertEqual(torch._C._get_fake_item_memo(dst, 5), 2)
+        self.assertEqual(torch._C._get_fake_item_memo(src, 5), 3)
+        dst.data = src
+        self.assertIsNone(torch._C._get_fake_item_memo(dst, 5))
+
 
 if __name__ == "__main__":
     run_tests()
