@@ -2012,6 +2012,11 @@ class cpp:
     # set to torch.get_num_threads()
     threads = -1
 
+    # Opt in to output-only FP32 CPU flash-attention decomposition. There is no
+    # size profitability filter: validate latency for the selected model before
+    # enabling this, especially for large query/key dimensions or batches.
+    enable_cpu_flash_attention_decomposition: bool = False
+
     # Do not generate loops when the condition doesn't hold, like:
     # for(long i0=4096; i0<4096; i0+=1)
     no_redundant_loops = (
