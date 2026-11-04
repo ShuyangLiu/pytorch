@@ -27,13 +27,16 @@ from .builtin import (
     ComplexBuiltinVariable,
     DictBuiltinVariable,
     FloatBuiltinVariable,
+    FrozenSetBuiltinVariable,
     GetAttrBuiltinVariable,
     HasAttrBuiltinVariable,
     IntBuiltinVariable,
     IterBuiltinVariable,
     ListBuiltinVariable,
     SetAttrBuiltinVariable,
+    SetBuiltinVariable,
     StrBuiltinVariable,
+    TupleBuiltinVariable,
 )
 from .constant import ConstantVariable
 from .ctx_manager import (
@@ -250,6 +253,9 @@ __all__ = [
     "BoolBuiltinVariable",
     "StrBuiltinVariable",
     "BytesBuiltinVariable",
+    "TupleBuiltinVariable",
+    "SetBuiltinVariable",
+    "FrozenSetBuiltinVariable",
     "BuiltinVariable",
     "ByteArrayBuiltinVariable",
     "ByteArrayIteratorVariable",
