@@ -924,8 +924,8 @@ if HAS_CUDA_AND_TRITON:
             self, cudagraphs_per_partition
         ):
             # The scheduler splits per op only when the partitions are for CUDA
-            # Graphs, whatever triton.cudagraphs says; otherwise everything,
-            # input asserts included, stays in call().
+            # Graphs requested by the top level, whatever triton.cudagraphs says;
+            # otherwise everything, input asserts included, stays in call().
             def f(x):
                 return x.sin() + 1
 
@@ -935,6 +935,7 @@ if HAS_CUDA_AND_TRITON:
                 _force_graph_lowering_decisions(
                     split_into_partitions=True,
                     cudagraphs_per_partition=cudagraphs_per_partition,
+                    cudagraphs_top_level=cudagraphs_per_partition,
                 ),
             ):
                 out, (code,) = run_and_get_code(torch.compile(f), x)
