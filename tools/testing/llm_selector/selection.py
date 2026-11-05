@@ -520,6 +520,9 @@ def needs_run_all(changed_files: list[str]) -> bool:
     return any(re.search(p, f) for p in RUN_ALL_PATTERNS for f in changed_files)
 
 
+TEST_INFRA_REASON = "change touches test infrastructure"
+
+
 def parse_model_output(
     out: object, candidates: set[str], grep: Callable[[str], list[str]] | None = None
 ) -> tuple[set[str], set[str]]:
@@ -669,7 +672,7 @@ class Selection:
                 return grep_failure(e)
             files, sweeps = set(), set()
         if needs_run_all(changed_files):
-            return cls(run_all=True, reason="change touches test infrastructure")
+            return cls(run_all=True, reason=TEST_INFRA_REASON)
         # Before any grep, so that a failed one cannot turn it into an error.
         if isinstance(out, dict) and out["run_all"]:
             return cls(
