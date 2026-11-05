@@ -7,6 +7,7 @@ import dataclasses
 import functools
 import gc
 import importlib
+import inspect
 import itertools
 import logging
 import math
@@ -108,6 +109,7 @@ from torch.testing._internal.common_quantization import (
     _group_quantize_tensor_symmetric,
 )
 from torch.testing._internal.common_utils import (
+    add_skip_condition,
     decorateIf,
     DeterministicGuard,
     instantiate_parametrized_tests,
@@ -124,6 +126,7 @@ from torch.testing._internal.common_utils import (
     periodic,
     recover_orig_fp32_precision,
     serialTest,
+    skip_reason_at_collection,
     skipIfNoLapack,
     skipIfRocm,
     skipIfRocmArch,
@@ -1222,6 +1225,8 @@ class SweepInputs2:
             )
 
         test.__name__ = f"test_{cls.gen.device}_{name1}_{name2}"
+        if cls.gen.device == "mps" and "double" in (name1, name2):
+            test = unittest.skip("MPS does not support torch.float64")(test)
         setattr(cls, test.__name__, test)
 
     @classmethod
@@ -1235,14 +1240,28 @@ def is_cpp_backend(device):
     return getattr(device, "type", device) == "cpu" and config.cpu_backend == "cpp"
 
 
-def skip_if_cpu(fn):
-    @functools.wraps(fn)
-    def wrapper(self, *args, **kwargs):
-        if self.device == "cpu":
-            raise unittest.SkipTest("cpu not supported")
-        return fn(self, *args, **kwargs)
+def skip_if_device(condition, reason):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            if condition(self.device):
+                raise unittest.SkipTest(reason)
+            return fn(self, *args, **kwargs)
 
-    return wrapper
+        def skip_at_collection(cls):
+            device = vars(cls).get("_device_at_collection")
+            if device is None:
+                return None
+            return condition(device)
+
+        add_skip_condition(wrapper, skip_at_collection, reason)
+        return wrapper
+
+    return decorator
+
+
+def skip_if_cpu(fn):
+    return skip_if_device(lambda device: device == "cpu", "cpu not supported")(fn)
 
 
 def skip_if_halide(fn):
@@ -1266,13 +1285,7 @@ def skip_if_pallas(fn):
 
 
 def skip_if_mps(fn):
-    @functools.wraps(fn)
-    def wrapper(self, *args, **kwargs):
-        if is_mps_backend(self.device):
-            raise unittest.SkipTest("mps not supported")
-        return fn(self, *args, **kwargs)
-
-    return wrapper
+    return skip_if_device(is_mps_backend, "mps not supported")(fn)
 
 
 def xfail_if_mps(fn):
@@ -1283,6 +1296,8 @@ def xfail_if_mps(fn):
         with self.assertRaises(Exception):
             return fn(self, *args, **kwargs)
 
+    # SkipTest is an expected exception here, so inner skips must run.
+    wrapper._skip_conditions = ()
     return wrapper
 
 
@@ -2595,6 +2610,7 @@ class CommonTemplate:
 
         self.common(fn, (torch.full((4,), float("-inf")),))
 
+    @skip_if_device(lambda device: device == "cpu", "Non-deterministic CPU results")
     def test_reduction4(self):
         if self.device == "cpu":
             raise unittest.SkipTest("Non-deterministic CPU results")
@@ -2606,6 +2622,7 @@ class CommonTemplate:
         for i in inputs:
             self.common(fn, (i,), check_lowp=not is_halide_backend(self.device))
 
+    @skip_if_device(lambda device: device == "cpu", "Non-deterministic CPU results")
     @config.patch(unroll_reductions_threshold=1)
     def test_reduction5(self):
         if self.device == "cpu":
@@ -2667,6 +2684,7 @@ class CommonTemplate:
             # make sure things also work if they aren't unrolled
             self.common(fn, (torch.randn(8, 3),))
 
+    @skip_if_device(lambda device: device == "cpu", f"requires {GPU_TYPE}")
     def test_multilayer_sum_low_prec(self):
         # fp16 nyi for cpu
         if self.device == "cpu":
@@ -2870,6 +2888,10 @@ class CommonTemplate:
 
             self.common(fn, (a, b), atol=1e-5, rtol=1e-5, check_lowp=False)
 
+    @skip_if_device(
+        lambda device: device != "cuda" and device != "xpu",
+        "associative_scan only supported on GPU",
+    )
     @skip_if_halide  # scan ops
     # TODO: support lifted symints when dynamic
     @torch._dynamo.config.patch(
@@ -2899,6 +2921,10 @@ class CommonTemplate:
         actual = associative_scan(logcumsum_combine, a, 0)
         self.assertEqual(expect, actual)
 
+    @skip_if_device(
+        lambda device: device != "cuda" and device != "xpu",
+        "associative_scan only supported on GPU",
+    )
     @skip_if_halide  # scan ops
     # TODO: support lifted symints when dynamic
     @torch._dynamo.config.patch(
@@ -2934,6 +2960,10 @@ class CommonTemplate:
                 r"triton_.*\.run\(arg[01]_1, arg[12]_1, buf1,"
             ).check_not("run(").run(code[0])
 
+    @skip_if_device(
+        lambda device: device != "cuda" and device != "xpu",
+        "associative_scan only supported on GPU",
+    )
     @skip_if_halide  # scan ops
     # TODO: support lifted symints when dynamic
     @torch._dynamo.config.patch(
@@ -2961,6 +2991,10 @@ class CommonTemplate:
         actual = associative_scan(argmax_combine, (a, idx), 0)
         self.assertEqual(expect, actual)
 
+    @skip_if_device(
+        lambda device: device != "cuda" and device != "xpu",
+        "associative_scan only supported on GPU",
+    )
     @skip_if_halide  # scan ops
     # TODO: support lifted symints when dynamic
     @torch._dynamo.config.patch(
@@ -3003,6 +3037,10 @@ class CommonTemplate:
         actual = compiled_scan(x, f)
         self.assertEqual(expect, actual)
 
+    @skip_if_device(
+        lambda device: device != "cpu",
+        f"No {GPU_TYPE} implementation (it returns empty)",
+    )
     def test_embedding_bag_byte_unpack(self):
         if self.device != "cpu":
             raise unittest.SkipTest(f"No {GPU_TYPE} implementation (it returns empty)")
@@ -3444,6 +3482,9 @@ class CommonTemplate:
             self.assertEqual(y, y_ref, atol=1e-4, rtol=1e-4)
             self.assertEqual(x.grad, x_ref.grad, atol=1e-4, rtol=1e-4)
 
+    @skip_if_device(
+        lambda device: device not in ("cuda", "xpu"), "split scan only supported on GPU"
+    )
     @skip_if_gpu_halide
     def test_cumprod_backward_split_scan_reduction_fusion(self):
         if self.device not in ("cuda", "xpu"):
@@ -3617,6 +3658,10 @@ class CommonTemplate:
 
         self.common(fn, (torch.randint(4, (4,)),))
 
+    @skip_if_device(
+        lambda device: device == "mps",
+        "MPS codegen doesn't upcast bf16 constants to float32",
+    )
     def test_comparison_scalar_type_promotion_bf16(self):
         if self.device == "mps":
             raise unittest.SkipTest(
@@ -4015,6 +4060,9 @@ class CommonTemplate:
         # with *100 we are always getting a number exactly at .5 which we don't do right in half
         self.common(fn, (torch.randn(8, 8) * 100, torch.randn(8, 8) * 10))
 
+    @skip_if_device(
+        lambda device: device == "cuda", "need to debug tl.libdevice on A100/V100"
+    )
     @xfail_if_triton_cpu
     def test_round_correctness(self):
         if self.device == "cuda":
@@ -4509,6 +4557,9 @@ for dtype in (torch.int32, torch.int64):
                 b = torch.full((8,), b_val, dtype=dtype, device=self.device)
                 self.common(fn, (a, b))
 
+    @skip_if_device(
+        lambda device: device not in ("cpu", "cuda"), "Only validated on CPU/CUDA"
+    )
     @parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
     def test_div_floor_float_nonfinite(self, dtype):
         if self.device not in ("cpu", "cuda"):
@@ -4551,6 +4602,9 @@ for dtype in (torch.int32, torch.int64):
         )
         self.common(fn, (a, b))
 
+    @skip_if_device(
+        lambda device: device == "cpu", "signed zero fix is Triton-specific"
+    )
     def test_minimum_signed_zero(self):
         # Regression test for https://github.com/pytorch/pytorch/issues/185610
         # torch.minimum(-0.0, +0.0) must return -0.0 per IEEE 754.
@@ -5276,6 +5330,7 @@ for dtype in (torch.int32, torch.int64):
         with self.assertRaisesRegex(NotImplementedError, msg):
             torch.compile(fn, fullgraph=True)(a, b)
 
+    @skip_if_device(lambda device: device != "cpu", "CPU-specific decomposition branch")
     @parametrize(
         "dtype", (torch.int8, torch.uint8, torch.int32, torch.int64, torch.float32)
     )
@@ -5418,6 +5473,10 @@ for dtype in (torch.int32, torch.int64):
         with self.assertRaisesRegex(RuntimeError, "Autograd not support dtype:.*"):
             torch.compile(fn)(t)
 
+    @skip_if_device(
+        lambda device: device == "cpu",
+        "using triton backend only is not supported on CPU",
+    )
     @unittest.skipIf(
         not IS_BIG_GPU, "Skipping triton backend only since not big GPU (not enough SM)"
     )
@@ -5482,6 +5541,7 @@ for dtype in (torch.int32, torch.int64):
                 (torch.randn(8, 12, 512, 512),),
             )
 
+    @skip_if_device(lambda device: device == GPU_TYPE, "only support cpu conv bn test")
     @slowTest
     @expectedFailureCodegenDynamic
     @config.patch({"freezing": True})
@@ -5544,6 +5604,7 @@ for dtype in (torch.int32, torch.int64):
                         (v,),
                     )
 
+    @skip_if_device(lambda device: device == GPU_TYPE, "only support cpu conv bn test")
     def test_conv_functional_bn_fuse(self):
         # For gpu path, there is an accuracy issue
         if self.device == GPU_TYPE:
@@ -5632,6 +5693,7 @@ for dtype in (torch.int32, torch.int64):
                 (v,),
             )
 
+    @skip_if_device(lambda device: device != GPU_TYPE, f"{GPU_TYPE} only test")
     @xfail_if_mps  # Expected to find .run(
     def test_conv_inference_heuristics(self):
         if self.device != GPU_TYPE:
@@ -5688,6 +5750,9 @@ for dtype in (torch.int32, torch.int64):
                     # without cpp_wrapper, the pattern is .convolution( and then .run(
                     FileCheck().check("convolution(").check(".run(").run(code[0])
 
+    @skip_if_device(
+        lambda device: device == GPU_TYPE, "only support cpu upsample_cat_conv test"
+    )
     def test_upsample_cat_conv(self):
         if self.device == GPU_TYPE:
             raise unittest.SkipTest("only support cpu upsample_cat_conv test")
@@ -6069,6 +6134,10 @@ for dtype in (torch.int32, torch.int64):
         with config.patch({"triton.use_block_ptr": use_block_ptr}):
             self.common(fn, (torch.randn(1, 3, *[10] * dim),))
 
+    @skip_if_device(
+        lambda device: device != "cpu",
+        "only the native CPU kernel preserves the input memory format",
+    )
     def test_max_unpool2d_channels_last(self):
         # https://github.com/pytorch/pytorch/issues/187173
         if self.device != "cpu":
@@ -6122,6 +6191,10 @@ for dtype in (torch.int32, torch.int64):
         x3d = torch.randn(1, 1, 1, 1, 1, device=self.device)
         self.common(Unpool3d().to(self.device), (x3d, x3d.long()))
 
+    @skip_if_device(
+        lambda device: device not in ("cpu", "xpu"),
+        "only CPU and XPU max_unpool2d preserve channels-last layout",
+    )
     def test_max_unpool2d_channels_last_stride(self):
         if self.device not in ("cpu", "xpu"):
             raise unittest.SkipTest(
@@ -6485,6 +6558,9 @@ for dtype in (torch.int32, torch.int64):
             reference_in_float=not torch.version.hip,
         )
 
+    @skip_if_device(
+        lambda device: device == GPU_TYPE, "only support cpu conv2d channels_last"
+    )
     def test_conv2d_channels_last(self):
         if self.device == GPU_TYPE:
             raise unittest.SkipTest("only support cpu conv2d channels_last")
@@ -6706,6 +6782,7 @@ for dtype in (torch.int32, torch.int64):
             check_lowp=False,
         )
 
+    @skip_if_device(lambda device: device != "cuda", "CUDA-only behavior")
     @skip_if_cpu
     @skipIfRocm  # Triton conv backward kernels stay enabled on ROCm
     @config.patch(
@@ -6876,6 +6953,9 @@ for dtype in (torch.int32, torch.int64):
         x = torch.randn(2, 4, 16)
         self.common(m, (x,), check_lowp=False)
 
+    @skip_if_device(
+        lambda device: device == GPU_TYPE, "only support cpu conv3d channels_last"
+    )
     @parametrize(
         "use_block_ptr",
         [
@@ -7851,6 +7931,10 @@ for dtype in (torch.int32, torch.int64):
             (torch.tensor([2, 4, 6]),),
         )
 
+    @skip_if_device(
+        lambda device: device == GPU_TYPE,
+        "only support cpu randn_with_dtype_and_device test",
+    )
     @config.patch(fallback_random=True)
     def test_randn_with_dtype_and_device(self):
         if self.device == GPU_TYPE:
@@ -7919,6 +8003,7 @@ for dtype in (torch.int32, torch.int64):
             (torch.randint(10, [2, 8]),),
         )
 
+    @skip_if_device(lambda device: device != "cpu", "CPU bounds check regression")
     @skip_if_halide  # cpp-only RuntimeError contract
     @skip_if_pallas  # cpp-only RuntimeError contract
     @skip_if_triton_cpu  # cpp-only RuntimeError contract
@@ -7976,6 +8061,7 @@ for dtype in (torch.int32, torch.int64):
             (weight, indices),
         )
 
+    @skip_if_device(lambda device: device != "cuda", "requires cuda")
     @config.patch(implicit_fallbacks=True)
     def test_no_grad_embedding_renorm_negative_indices(self):
         if self.device != "cuda":
@@ -8117,6 +8203,7 @@ for dtype in (torch.int32, torch.int64):
         )
 
     # From yolov3
+    @skip_if_device(lambda device: device == "cpu", f"requires {GPU_TYPE}")
     @with_tf32_off
     def test_batch_norm_2d_2(self):
         if self.device == "cpu":
@@ -8166,6 +8253,9 @@ for dtype in (torch.int32, torch.int64):
         if self.device != "cpu":
             assertGeneratedKernelCountEqual(self, 1)
 
+    @skip_if_device(
+        lambda device: device not in ("cpu", "cuda"), "Only validated on CPU/CUDA"
+    )
     def test_layer_norm_rejects_complex_inputs(self):
         if self.device not in ("cpu", "cuda"):
             raise unittest.SkipTest("Only validated on CPU/CUDA")
@@ -8818,6 +8908,7 @@ for dtype in (torch.int32, torch.int64):
             (torch.randn([16, 16]),),
         )
 
+    @skip_if_device(lambda device: device != "cuda", "requires CUDA")
     def test_infinitely_differentiable_gelu_backward_bfloat16(self):
         if self.device != "cuda":
             raise unittest.SkipTest("requires CUDA")
@@ -9677,6 +9768,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         self.common(fn, (torch.randn([1, 16]), torch.randn([12, 1])))
 
+    @skip_if_device(
+        lambda device: device == "cpu", "cat always uses ConcatKernel on CPU"
+    )
     @config.patch(cat_fuse_computed_input_copies=True)
     def test_stack_realized_inputs(self):
         # Each input reads x eight times, so it is realized before stack, and
@@ -9694,6 +9788,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn([4096, 16]),))
         assertGeneratedKernelCountEqual(self, 1)
 
+    @skip_if_device(
+        lambda device: device == "cpu", "cat always uses ConcatKernel on CPU"
+    )
     @config.patch(cat_fuse_computed_input_copies=True)
     def test_stack_realized_input_twice(self):
         # One realized buffer copied into two slices, plus another reader; both
@@ -9709,6 +9806,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn([4096, 16]),))
         assertGeneratedKernelCountEqual(self, 1)
 
+    @skip_if_device(
+        lambda device: device == "cpu", "cat always uses ConcatKernel on CPU"
+    )
     def test_stack_cat_rule_exclusions(self):
         # The cat rule only reroutes whole computed buffers; a slice of one and a
         # no-op buffer compile as without it.
@@ -9734,6 +9834,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 codes.append(re.sub(r"# AOT ID: .*", "", code))
             self.assertEqual(codes[0], codes[1], fn.__name__)
 
+    @skip_if_device(
+        lambda device: device == "cpu", "cat always uses ConcatKernel on CPU"
+    )
     @config.patch(cat_fuse_computed_input_copies=True)
     def test_stack_pad_cheap_inputs(self):
         # Stacks of cheap pointwise inputs stay one pointwise cat kernel.
@@ -9897,6 +10000,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             ):
                 c_fn(x)
 
+    @skip_if_device(lambda device: device != "cuda", "CUDA only")
     def test_convolution_errors_on_input_weight_dtype_mismatch(self):
         if self.device != "cuda":
             raise unittest.SkipTest("CUDA only")
@@ -9914,6 +10018,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         ):
             c_fn(x)
 
+    @skip_if_device(lambda device: device != "cpu", "CPU only")
     @torch._dynamo.config.patch(recompile_limit=32)
     def test_convolution_errors_with_uint_input_float_weight(self):
         if self.device != "cpu":
@@ -10280,6 +10385,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         self.common(fn, (x, y))
 
+    @skip_if_device(
+        lambda device: device != "cpu",
+        "CPU-only: uint8 Inductor integer divide-by-zero RuntimeError check",
+    )
     @skip_if_halide  # cpp-only RuntimeError contract
     @skip_if_pallas  # cpp-only RuntimeError contract
     @skip_if_triton_cpu  # cpp-only RuntimeError contract
@@ -10299,6 +10408,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         with self.assertRaisesRegex(RuntimeError, "ZeroDivisionError"):
             opt(inp, divisor)
 
+    @skip_if_device(
+        lambda device: device != "cpu",
+        "CPU-only: uint8 Inductor integer divide-by-zero RuntimeError check",
+    )
     @skip_if_halide  # cpp-only RuntimeError contract
     @skip_if_pallas  # cpp-only RuntimeError contract
     @skip_if_triton_cpu  # cpp-only RuntimeError contract
@@ -10495,6 +10608,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 ),
             )
 
+    @skip_if_device(lambda device: device == "cpu", f"requires {GPU_TYPE}")
     @xfail_if_mps_unimplemented
     @skipCUDAIf(not TEST_CUDNN, "CUDNN not available")
     @skipIfXpu
@@ -10760,6 +10874,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             rtol=1.3e-06,
         )
 
+    @skip_if_device(
+        lambda device: not device.startswith("cuda") and (not device.startswith("xpu")),
+        "requires CUDA or XPU",
+    )
     @requires_gpu()
     def test_grid_sampler_expand_preserves_view(self):
         if not self.device.startswith("cuda") and not self.device.startswith("xpu"):
@@ -10994,6 +11112,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             ),
         )
 
+    @skip_if_device(
+        lambda device: device != "cpu", "quantized tensor kernels are CPU-only"
+    )
     @lowering.force_fallback(aten.quantize_per_tensor.default)
     def test_quantize_per_tensor_fallback_output_dtype(self):
         if self.device != "cpu":
@@ -11116,6 +11237,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             fn, (torch.empty_strided((2, 4, 5), (20, 1, 4), dtype=torch.float32),)
         )
 
+    @skip_if_device(
+        lambda device: device != "cpu", "compile_fx_inner repro is CPU-only"
+    )
     def test_constant_pad_nd_fallback_python_dispatch_stride(self):
         if self.device != "cpu":
             raise unittest.SkipTest("compile_fx_inner repro is CPU-only")
@@ -12228,6 +12352,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         self.common(fn, (torch.randn(8, 8), torch.arange(4), torch.ones(4, 8)))
 
+    @skip_if_device(
+        lambda device: is_mps_backend(device),
+        "no deterministic index_put accumulate on MPS",
+    )
     def test_index_put_deterministic_fallback(self):
         if is_mps_backend(self.device):
             # MPS has no deterministic implementation for
@@ -12794,6 +12922,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             ],
         )
 
+    @skip_if_device(lambda device: device == "cuda", "unstable on sm86")
     def test_scatter2(self):
         if self.device == "cuda":
             raise unittest.SkipTest("unstable on sm86")
@@ -13114,6 +13243,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     # `requires_gpu` otherwise
     # RuntimeError: pin_memory=True requires a CUDA or other accelerator backend;
     # no pinned memory allocator is available on this system.
+    @skip_if_device(
+        lambda device: device != "cpu", "pin_memory is not supported on non-CPU devices"
+    )
     @requires_gpu()
     @unittest.skipIf(IS_MACOS, "fails on macos")
     @parametrize(
@@ -13158,6 +13290,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertTrue(result.is_pinned())
         self.assertEqual(result.shape, expected_shape)
 
+    @skip_if_device(
+        lambda device: device != "cpu", "pin_memory is not supported on non-CPU devices"
+    )
     @requires_gpu()
     @unittest.skipIf(IS_MACOS, "fails on macos")
     @dynamo_config.patch(assume_static_by_default=False)
@@ -13173,6 +13308,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertTrue(result.is_pinned())
         self.assertEqual(result, torch.tensor([1, 2, 3], device=self.device))
 
+    @unittest.skipIf(
+        not torch.backends.mkldnn.is_available(), "MKLDNN is not available"
+    )
+    @skip_if_device(lambda device: device != "cpu", "MKLDNN constants are CPU-only")
     def test_mkldnn_constant_buffer_is_not_checked_for_pin_memory(self):
         if self.device != "cpu":
             raise unittest.SkipTest("MKLDNN constants are CPU-only")
@@ -13580,6 +13719,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(a1, b1)
         self.assertEqual(a2, b2)
 
+    @skip_if_device(
+        lambda device: device == "cpu",
+        f"functionalization of rng ops supported only on {GPU_TYPE}",
+    )
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
     @expectedFailureXPU
     @skip_if_gpu_halide  # rand
@@ -13660,6 +13803,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             ),
         )
 
+    @skip_if_device(
+        lambda device: device == "cpu", "conv2d randn ordering requires CUDA"
+    )
     @parametrize(
         "fallback_random",
         [
@@ -13691,6 +13837,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
             self.assertEqual(compiled_out, eager_out)
 
+    @skip_if_device(
+        lambda device: device == "cpu", "conv2d randn ordering requires CUDA"
+    )
     @config.patch(fallback_random=True)
     @with_tf32_off
     def test_tuple_output_rng_order_preserved(self):
@@ -14372,6 +14521,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertTrue(same(r2, r3))
         self.assertTrue(same(g2, g3))
 
+    @skip_if_device(
+        lambda device: is_mps_backend(device),
+        "MPS Inductor does not lower aten.linear_backward",
+    )
     @config.patch(search_autotune_cache=False)
     def test_dropout3(self):
         if is_mps_backend(self.device):
@@ -14497,6 +14650,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertTrue(-0.2 < t.mean().item() < 0.2)
             self.assertTrue(0.7 < t.std().item() < 1.3)
 
+    @skip_if_device(lambda device: device != GPU_TYPE, "Only valid for GPU!")
     @xfail_if_mps  # Only works for triton
     def test_randint_kernel_count(self):
         if self.device != GPU_TYPE:
@@ -15102,6 +15256,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     def test_fp16_cast_log1p(self):
         self.common(lambda x: x.half().log1p(), (torch.rand(8) * 1e-3,))
 
+    @decorateIf(
+        skip_if_device(
+            lambda device: device == "mps",
+            "dtype torch.float64 not supported for device mps",
+        ),
+        lambda p: p["dtype"] == torch.float64,
+    )
+    @skip_if_device(lambda device: device == "cpu", "Testing mixed devices")
     @parametrize(
         "dtype",
         test_dtypes,
@@ -15251,6 +15413,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         x = torch.randn(64, 64, dtype=torch.float32, device=self.device)
         self.common(fn, (x,))
 
+    @skip_if_device(lambda device: device == GPU_TYPE, "histogramdd only supports cpu")
     def test_kwargs(self):
         if self.device == GPU_TYPE:
             raise unittest.SkipTest("histogramdd only supports cpu")
@@ -15586,6 +15749,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         ):
             layout.size = (z,)
 
+    @skip_if_device(
+        lambda device: device == GPU_TYPE, "sqrt dynamic shapes only supports cpu"
+    )
     def test_sqrt_dynamic_shapes(self):
         # TIMM convit_base model: https://github.com/pytorch/pytorch/issues/97877.
         # TODO: support cuda path.
@@ -15843,6 +16009,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         # expanded dim should not cause copy in require_stride_order
         assertGeneratedKernelCountEqual(self, 0)
 
+    @skip_if_device(lambda device: device == "cpu", f"requires {GPU_TYPE}")
     @requires_gpu()
     @parametrize("prefer_nd_tiling", (False, True))
     @parametrize(
@@ -16540,6 +16707,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             rtol=1e-2,  # to pass lowp check on GPU
         )
 
+    @skip_if_device(lambda device: device != "cpu", "cpu only")
     @skip_if_halide
     @skip_if_pallas  # cpp-only fusion path
     @skip_if_triton_cpu
@@ -16563,6 +16731,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         actual = torch.compile(fn, backend="inductor", fullgraph=True)(x)
         self.assertEqual(actual, expected)
 
+    @skip_if_device(lambda device: device != "cpu", "cpu only")
     @skip_if_halide
     @skip_if_pallas  # cpp-only fusion path
     @skip_if_triton_cpu
@@ -16584,6 +16753,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         actual = torch.compile(fn, backend="inductor", fullgraph=True)(x)
         self.assertEqual(actual, expected)
 
+    @skip_if_device(lambda device: device == "cpu", f"requires {GPU_TYPE}")
     @xfail_if_mps_unimplemented
     @unittest.skipIf(
         not PLATFORM_SUPPORTS_MEM_EFF_ATTENTION, "Some archs don't support mem eff SDPA"
@@ -17858,6 +18028,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(ref, actual)
         self.assertTrue(called)
 
+    @skip_if_device(
+        lambda device: device == "cpu", "requires GPU for device mismatch test"
+    )
     @requires_gpu()
     @parametrize("inplace", [False, True])
     def test_index_add_device_mismatch(self, inplace):
@@ -18275,6 +18448,16 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         with ctx:
             self.common(fn, args, check_lowp=check_lowp, atol=1e-4, rtol=1e-4)
 
+    @decorateIf(
+        skip_if_device(
+            lambda device: device == "mps", "dtype torch.float64 not supported on mps"
+        ),
+        lambda p: p["dtype"] == torch.float64,
+    )
+    @skip_if_device(
+        lambda device: device == "mps",
+        "aten::special_log_ndtr.out not implemented on MPS",
+    )
     @parametrize("dtype", [torch.float32, torch.float64])
     def test_log_ndtr_signbit(self, dtype):
         """Regression test for https://github.com/pytorch/pytorch/issues/187336."""
@@ -18760,6 +18943,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertFalse(".run(" in code[0])
 
     # skip cpu test since rms norm is always decomposed on cpu
+    @skip_if_device(
+        lambda device: device != GPU_TYPE or device == "mps", "requires GPU"
+    )
     def test_lite_mode_not_decompose(self):
         if self.device != GPU_TYPE or self.device == "mps":
             raise unittest.SkipTest("requires GPU")
@@ -18790,6 +18976,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         else:
             FileCheck().check("torch.ops.aten._fused_rms_norm.default(").run(codes[0])
 
+    @skip_if_device(
+        lambda device: device != GPU_TYPE or device == "mps", "requires GPU"
+    )
     def test_lite_regional_compile_flex_attention(self):
         if self.device != GPU_TYPE or self.device == "mps":
             raise unittest.SkipTest("requires GPU")
@@ -18852,6 +19041,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         _, codes = run_fw_bw_and_get_code(lambda: opt_fn(x))
         self.assertEqual(len(codes), 2)
 
+    @skip_if_device(lambda device: device != GPU_TYPE, "requires GPU")
     def test_lite_mode_cpp_wrapper_optional_device_arg(self):
         # Lite mode makes `aten::zeros_like` (a `Device? device=None` op with no
         # c-shim) a StableIValue-path fallback: the shortest repro for the missing
@@ -18929,6 +19119,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
         self.assertNotIn("aten.cos", body)
 
+    @skip_if_device(
+        lambda device: device != GPU_TYPE or device == "mps", "requires GPU"
+    )
     def test_lite_triton_kernel_wrapper_functional(self):
         if self.device != GPU_TYPE or self.device == "mps":
             raise unittest.SkipTest("requires GPU")
@@ -19549,6 +19742,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         ref = pad_same(x, (5, 5), (2, 2))
         self.assertEqual(res, ref, atol=0, rtol=0)
 
+    @skip_if_device(
+        lambda device: device == "cpu",
+        "Intermittent failures on CPU in CI",
+    )
     @skip_if_halide  # only 32-bit indexing
     @largeTensorTest("16GB", inductor=True)
     def test_split_reduction_with_int64_size(self):
@@ -19727,6 +19924,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 FileCheck().check("cpp_fused_add_0").run(code)
             self.assertEqual(refe_out, test_out)
 
+    @skip_if_device(
+        lambda device: device != GPU_TYPE or device == "mps", "requires GPU"
+    )
     def test_triton_kernel_bool_param(self):
         if self.device != GPU_TYPE or self.device == "mps":
             raise unittest.SkipTest("requires GPU")
@@ -19749,6 +19949,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         inputs = (torch.randn(4, device=self.device),)
         self.common(Model(), inputs)
 
+    @skip_if_device(
+        lambda device: device != GPU_TYPE or device == "mps", "requires GPU"
+    )
     @requires_gpu_and_triton
     def test_triton_kernel_bool_tensor_arg(self):
         if self.device != GPU_TYPE or self.device == "mps":
@@ -20186,6 +20389,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             (act, act_grad), (ref, ref_grad), atol=1e-3, rtol=1e-3, equal_nan=False
         )
 
+    @skip_if_device(lambda device: device == "cpu", "Skip for CPU device")
     @xfail_if_mps  # MPS codegen does not emit ReductionHint.OUTER
     def test_inner_reduction_detection(self):
         if self.device == "cpu":
@@ -20201,6 +20405,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertTrue("ReductionHint.OUTER" in code)
         self.assertFalse("ReductionHint.INNER" in code)
 
+    @skip_if_device(lambda device: device == "cpu", "Skip for CPU device")
     @config.patch(force_disable_caches=True)
     @xfail_if_mps  # MPS codegen does not emit ReductionHint.OUTER
     def test_broadcasted_inner_reduction_detection(self):
@@ -20920,6 +21125,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         for eg, cg in zip(eager_grads, compiled_grads, strict=True):
             self.assertEqual(eg, cg)
 
+    @skip_if_device(lambda device: device != "cuda", "CUDA OOM regression test")
     def test_efficient_zero_tensor_avoids_oom(self):
         if self.device != "cuda":
             raise unittest.SkipTest("CUDA OOM regression test")
@@ -21063,6 +21269,10 @@ class TestFailure:
 
 
 def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):
+    # These template targets keep a fixed device through setup and test wrappers.
+    device = inspect.getattr_static(other_cls, "device", None)
+    if isinstance(device, (str, torch.device)):
+        other_cls._device_at_collection = device
     for name, value in my_cls.__dict__.items():
         if name.startswith("test_"):
             # You cannot copy functions in Python, so we use closures here to
@@ -23718,6 +23928,61 @@ if RUN_CPU:
                         ret_opt = fn_opt(pytype, dtype)
 
                 self.assertEqual(ret_opt, fn(pytype, dtype))
+
+
+@instantiate_parametrized_tests
+class TestSkipIfDevice(TestCase):
+    def test_xfail_consumes_runtime_skip(self):
+        class Example:
+            device = "mps"
+            _device_at_collection = "mps"
+            assertRaises = self.assertRaises
+
+            @xfail_if_mps
+            @skip_if_device(lambda device: device == "mps", "inner skip")
+            def run(self):
+                raise AssertionError("must raise SkipTest first")
+
+        self.assertIsNone(skip_reason_at_collection(Example, Example.run, "run"))
+        Example().run()
+
+    def test_instance_device_keeps_runtime_decision(self):
+        class Example:
+            device = "cpu"
+
+            def __init__(self):
+                self.device = "cuda"
+
+            @skip_if_device(lambda device: device != "cuda", "requires CUDA")
+            def run(self):
+                return "ran"
+
+        self.assertIsNone(skip_reason_at_collection(Example, Example.run, "run"))
+        self.assertEqual(Example().run(), "ran")
+
+    @parametrize("device_type", ["cpu", "cuda"])
+    @parametrize("device_object", [False, True])
+    @parametrize("descriptor", [False, True])
+    def test_collection_and_runtime(self, device_type, device_object, descriptor):
+        value = torch.device(device_type) if device_object else device_type
+        reason = "requires CUDA"
+
+        class Example:
+            device = property(lambda self: value) if descriptor else value
+            _device_at_collection = None if descriptor else value
+
+            @skip_if_device(lambda device: str(device) != "cuda", reason)
+            def run(self):
+                return "ran"
+
+        expected = reason if device_type == "cpu" and not descriptor else None
+        actual = skip_reason_at_collection(Example, Example.run, "run")
+        self.assertEqual(actual, expected)
+        if device_type == "cpu":
+            with self.assertRaisesRegex(unittest.SkipTest, reason):
+                Example().run()
+        else:
+            self.assertEqual(Example().run(), "ran")
 
 
 def _strip_tmp_path(code: str) -> str:

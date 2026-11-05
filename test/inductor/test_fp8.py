@@ -34,6 +34,7 @@ from torch.testing._internal.common_device_type import (
 )
 from torch.testing._internal.common_quantized import ceil_div, to_blocked
 from torch.testing._internal.common_utils import (
+    decorateIf,
     instantiate_parametrized_tests,
     parametrize,
     random_matrix_with_scaled_reduction_dim,
@@ -1303,6 +1304,10 @@ class TestFP8Lowering(TestCase):
         with self.assertRaisesRegex(RuntimeError, r"t\(\) expects"):
             torch.compile(fn, fullgraph=True)(x_fp8, w_fp8, scale_a, scale_b)
 
+    @decorateIf(
+        unittest.skip("bias is not supported when output dtype is float32"),
+        lambda params: params["dtype"] is torch.float32 and params["has_bias"],
+    )
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     @parametrize("dtype", (torch.bfloat16, torch.float32))
     @parametrize("shape", ("16,16,32", "16,32,32", "1024,1024,512"))

@@ -5481,6 +5481,9 @@ class TestGuardSerialization(TestGuardSerializationBase):
             True,
         )
 
+    @unittest.skipIf(
+        not torch.distributed.is_available(), "Torch distributed is not available"
+    )
     def test_ddp_module(self):
         import torch.distributed as dist
 
@@ -5599,6 +5602,9 @@ class TestGuardSerialization(TestGuardSerializationBase):
             True,
         )
 
+    @unittest.skipIf(
+        not torch.distributed.is_available(), "Torch distributed is not available"
+    )
     def test_unserializable_sharded_tensor(self):
         import torch.distributed as dist
 
@@ -5651,6 +5657,9 @@ class TestGuardSerialization(TestGuardSerializationBase):
             ref, loaded, {"inputs": Inputs(x, global_func_wrong_fqn)}, True
         )
 
+    @unittest.skipIf(
+        not torch.distributed.is_available(), "Torch distributed is not available"
+    )
     def test_c10d_work(self):
         import torch.distributed as dist
 
@@ -5701,6 +5710,9 @@ class TestGuardSerialization(TestGuardSerializationBase):
         )
         self._test_check_fn(ref, loaded, {"inputs": Inputs(x, weakref.ref(x))}, True)
 
+    @unittest.skipIf(
+        not torch.distributed.is_available(), "Torch distributed is not available"
+    )
     def test_unused_process_group(self):
         import torch.distributed as dist
 

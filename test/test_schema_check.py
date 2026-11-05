@@ -102,13 +102,9 @@ class IncorrectAliasTensor(torch.Tensor):
         return tree_map(wrap, out)
 
 # Tests various schema checking functionalities.
+@unittest.skipIf(TEST_WITH_TORCHDYNAMO, "SchemaCheckMode is ignored by dynamo")
 class TestSchemaCheck(JitTestCase):
     hw_classification = HardwareClassification.GENERIC
-
-    def setUp(self):
-        if TEST_WITH_TORCHDYNAMO:
-            self.skipTest("SchemaCheckMode is ignored by dynamo")
-        super().setUp()
 
     # Tests that SchemaCheckMode records operator order with grad
     def test_schema_check_mode_operator_order(self):

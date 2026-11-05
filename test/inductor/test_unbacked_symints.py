@@ -22,7 +22,7 @@ from torch.testing._internal.common_device_type import (
     skipCUDAIf,
     skipGPUIf,
 )
-from torch.testing._internal.common_utils import parametrize, skipIfXpu
+from torch.testing._internal.common_utils import decorateIf, parametrize, skipIfXpu
 from torch.testing._internal.inductor_utils import HAS_GPU
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
@@ -181,6 +181,10 @@ class TestUnbackedSymints(InductorTestCase):
         expected = fn(*example_inputs)
         torch.testing.assert_close(actual, expected)
 
+    @decorateIf(
+        unittest.skip("Triton kernel requires GPU"),
+        lambda params: params["device"] == "cpu",
+    )
     @skipGPUIf(not HAS_GPU, "requires gpu and triton")
     @dynamo_config.patch({"capture_scalar_outputs": True})
     def test_triton_kernel_grid(self, device):
@@ -574,6 +578,10 @@ class TestUnbackedSymints(InductorTestCase):
         expected = fn(*example_inputs)
         torch.testing.assert_close(actual, expected)
 
+    @decorateIf(
+        unittest.skip("scaled_dot_product_flash_attention has no CPU backend"),
+        lambda params: params["device"] == "cpu",
+    )
     @skipGPUIf(not HAS_GPU, "requires gpu and triton")
     @skipCUDAIf(not SM80OrLater, "Requires sm80 or later.")
     @dynamo_config.patch({"capture_dynamic_output_shape_ops": True})
@@ -600,6 +608,10 @@ class TestUnbackedSymints(InductorTestCase):
         x = torch.tensor([1.0, 0.0, 1.0, 0.0], device=device)
         torch.compile(fn, fullgraph=True)(x)
 
+    @decorateIf(
+        unittest.skip("scaled_dot_product_attention has no CPU backend"),
+        lambda params: params["device"] == "cpu",
+    )
     @skipGPUIf(not HAS_GPU, "requires gpu and triton")
     @skipCUDAIf(not SM80OrLater, "Requires sm80 or later.")
     @dynamo_config.patch({"capture_dynamic_output_shape_ops": True})
@@ -677,6 +689,10 @@ class TestUnbackedSymints(InductorTestCase):
         expected = fn(*example_inputs)
         torch.testing.assert_close(actual, expected)
 
+    @decorateIf(
+        unittest.skip("Combo kernels must be for GPU."),
+        lambda params: params["device"] == "cpu",
+    )
     @skipGPUIf(not HAS_GPU, "requires gpu and triton")
     @dynamo_config.patch({"capture_dynamic_output_shape_ops": True})
     @inductor_config.patch({"combo_kernels": True, "benchmark_combo_kernel": True})
@@ -1193,6 +1209,10 @@ class TestUnbackedSymints(InductorTestCase):
             ):
                 self.assertFalse(layout.is_stride_ordered([1, 0]))
 
+    @decorateIf(
+        unittest.skip("wrapper codegen unit test only needs one device"),
+        lambda p: p["device"] != "cpu",
+    )
     def test_python_wrapper_binds_symbol_from_compound_input_expr(self, device):
         if device != "cpu":
             self.skipTest("wrapper codegen unit test only needs one device")
