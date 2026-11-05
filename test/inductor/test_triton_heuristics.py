@@ -71,7 +71,10 @@ from torch._inductor.runtime.triton_heuristics import (
     CachingAutotuner,
     CachingAutotunerPlugin,
     check_autotune_cache,
+    config_to_dict,
     DEFER,
+    GridExpr,
+    PrecomputedGrid,
     make_matmul_triton_config,
     template,
     triton_config,
@@ -1992,6 +1995,584 @@ class TestGridExprMaximum(TestCase):
         self.assertNotIn("(long)", result)
         # All ints: constant-folds
         self.assertEqual(grid.maximum([10, 20, 5]), 20)
+
+
+class TestPrecomputedGridConfigMatching(TestCase):
+    # Candidates carrying different grids for different num_warps values
+    # (a grid may read values carried in the config kwargs), so each
+    # candidate is distinguishable by both index and grid.
+    _GRIDS = {4: "8", 8: "4"}
+
+    @staticmethod
+    def _cand(config, grid):
+        return {
+            "config": config,
+            "python": [grid, "1", "1"],
+            "cpp": [f"{grid}L", "1L", "1L"],
+            "python_slow": [grid, "1", "1"],
+        }
+
+    def _candidates(self, warps_order=(4, 8)):
+        return [
+            self._cand(
+                {"BLOCK": 128, "num_warps": num_warps, "num_stages": 2},
+                self._GRIDS[num_warps],
+            )
+            for num_warps in warps_order
+        ]
+
+    def _make_grid(self, warps_order=(4, 8), declared_constexpr_names=()):
+        return PrecomputedGrid(
+            inductor_meta={
+                "precomputed_grids": self._candidates(warps_order),
+                "declared_constexpr_names": list(declared_constexpr_names),
+            },
+            mode="python",
+        )
+
+    def test_exact_match_selects_warps_dependent_grid(self):
+        # An exact config (num_warps included) must select its own
+        # candidate even though another candidate shares the BLOCK size.
+        for num_warps, expected in self._GRIDS.items():
+            with self.subTest(num_warps=num_warps):
+                grid = self._make_grid()
+                grid.generate({"BLOCK": 128, "num_warps": num_warps, "num_stages": 2})
+                self.assertEqual(
+                    (grid.x_grid, grid.y_grid, grid.z_grid), (expected, "1", "1")
+                )
+
+    def test_matches_pipelining_disabled_retry_config(self):
+        # compile_by_disabling_pipelining retries with num_stages=1 when
+        # the chosen config exceeds shared memory; the retry must still
+        # select the candidate for the chosen num_warps.
+        candidates = self._candidates()
+        self.assertEqual(
+            PrecomputedGrid.find_candidate_index(
+                candidates, {"BLOCK": 128, "num_warps": 8, "num_stages": 1}
+            ),
+            1,
+        )
+        grid = self._make_grid()
+        grid.generate({"BLOCK": 128, "num_warps": 8, "num_stages": 1})
+        self.assertEqual((grid.x_grid, grid.y_grid, grid.z_grid), ("4", "1", "1"))
+
+    def test_candidate_order_does_not_change_result(self):
+        for warps_order in [(4, 8), (8, 4)]:
+            with self.subTest(warps_order=warps_order):
+                candidates = self._candidates(warps_order)
+                idx = PrecomputedGrid.find_candidate_index(
+                    candidates, {"BLOCK": 128, "num_warps": 8, "num_stages": 1}
+                )
+                self.assertEqual(candidates[idx]["config"]["num_warps"], 8)
+                grid = self._make_grid(warps_order)
+                grid.generate({"BLOCK": 128, "num_warps": 8, "num_stages": 1})
+                self.assertEqual(
+                    (grid.x_grid, grid.y_grid, grid.z_grid), ("4", "1", "1")
+                )
+
+    def test_exact_match_distinguishes_num_stages(self):
+        # Candidates differing only in num_stages: exact lookups select
+        # their own candidate (the relaxed tier only applies to a
+        # lookup num_stages of 1, which neither lookup here uses).
+        candidates = [
+            {
+                "config": {"BLOCK": 128, "num_warps": 8, "num_stages": 3},
+                "python": ["6", "1", "1"],
+                "cpp": ["6L", "1L", "1L"],
+                "python_slow": ["6", "1", "1"],
+            },
+            {
+                "config": {"BLOCK": 128, "num_warps": 8, "num_stages": 2},
+                "python": ["4", "1", "1"],
+                "cpp": ["4L", "1L", "1L"],
+                "python_slow": ["4", "1", "1"],
+            },
+        ]
+        self.assertEqual(
+            PrecomputedGrid.find_candidate_index(
+                candidates, {"BLOCK": 128, "num_warps": 8, "num_stages": 2}
+            ),
+            1,
+        )
+        self.assertEqual(
+            PrecomputedGrid.find_candidate_index(
+                candidates, {"BLOCK": 128, "num_warps": 8, "num_stages": 3}
+            ),
+            0,
+        )
+
+    def test_num_stages_kwarg_is_not_relaxed(self):
+        # NUM_STAGES is a user kernel kwarg a grid can read, so it must
+        # match exactly: a retried lookup (lowered to 1) finds no
+        # candidate instead of reusing a grid computed for NUM_STAGES=3.
+        candidates = [
+            {
+                "config": {
+                    "BLOCK": 128,
+                    "NUM_STAGES": 3,
+                    "num_warps": 8,
+                    "num_stages": 3,
+                },
+                "python": ["4", "1", "1"],
+                "cpp": ["4L", "1L", "1L"],
+                "python_slow": ["4", "1", "1"],
+            }
+        ]
+        self.assertEqual(
+            PrecomputedGrid.find_candidate_index(
+                candidates,
+                {"BLOCK": 128, "NUM_STAGES": 3, "num_warps": 8, "num_stages": 3},
+            ),
+            0,
+        )
+        with self.assertRaisesRegex(RuntimeError, "Precomputed grid not found"):
+            PrecomputedGrid.find_candidate_index(
+                candidates,
+                {"BLOCK": 128, "NUM_STAGES": 1, "num_warps": 8, "num_stages": 1},
+            )
+        # This lookup raises because NUM_STAGES is never relaxed (its
+        # num_stages=3 also keeps it out of the relaxed tier, which is
+        # gated on the lookup num_stages being 1; see
+        # test_relaxed_tier_requires_lookup_num_stages_one).
+        with self.assertRaisesRegex(RuntimeError, "Precomputed grid not found"):
+            PrecomputedGrid.find_candidate_index(
+                candidates,
+                {"BLOCK": 128, "NUM_STAGES": 1, "num_warps": 8, "num_stages": 3},
+            )
+        # A relaxed lookup still has to match every other key.
+        with self.assertRaisesRegex(RuntimeError, "Precomputed grid not found"):
+            PrecomputedGrid.find_candidate_index(
+                candidates,
+                {"BLOCK": 64, "NUM_STAGES": 3, "num_warps": 8, "num_stages": 1},
+            )
+
+    def test_from_meta_with_retried_config(self):
+        # The entry point make_launcher() uses, with a real triton.Config
+        # so from_meta's config_to_dict conversion runs: candidates
+        # stored from the pre-retry config (num_stages=3), looked up
+        # with the retried config (num_stages lowered to 1 by
+        # compile_by_disabling_pipelining).
+        from torch._inductor.runtime.triton_compat import triton
+
+        stored = triton.Config({"BLOCK": 128}, num_warps=8, num_stages=3)
+        inductor_meta = {
+            "grid_type": "PrecomputedGrid",
+            "precomputed_grids": [self._cand(config_to_dict(stored), "4")],
+        }
+        retried = triton.Config({"BLOCK": 128}, num_warps=8, num_stages=1)
+        grid = GridExpr.from_meta(inductor_meta, retried)
+        self.assertEqual((grid.x_grid, grid.y_grid, grid.z_grid), ("4", "1", "1"))
+        # With num_stages declared as a constexpr, generate must not
+        # reuse the stored grid for the retried config.
+        declared_meta = {
+            **inductor_meta,
+            "declared_constexpr_names": ["num_stages"],
+        }
+        with self.assertRaisesRegex(RuntimeError, "Precomputed grid not found"):
+            GridExpr.from_meta(declared_meta, retried)
+
+    def test_first_subset_match_wins(self):
+        # First tier: the first candidate whose keys are a subset of the
+        # lookup wins, so candidate order decides between a BLOCK-only
+        # candidate and a more specific one.
+        candidates = [
+            self._cand({"BLOCK": 128}, "7"),
+            self._cand({"BLOCK": 128, "num_warps": 8}, "4"),
+        ]
+        lookup = {"BLOCK": 128, "num_warps": 8, "num_stages": 2}
+        for ordered, expected_grid in [(candidates, "7"), (candidates[::-1], "4")]:
+            with self.subTest(expected_grid=expected_grid):
+                idx = PrecomputedGrid.find_candidate_index(ordered, lookup)
+                self.assertEqual(ordered[idx]["python"][0], expected_grid)
+
+    def test_exact_tier_wins_over_relaxed_tier(self):
+        # A num_stages=1 lookup with an exactly matching candidate must
+        # select it, not relax onto the earlier num_stages=3 candidate.
+        candidates = [
+            {
+                "config": {"BLOCK": 128, "num_warps": 8, "num_stages": 3},
+                "python": ["6", "1", "1"],
+                "cpp": ["6L", "1L", "1L"],
+                "python_slow": ["6", "1", "1"],
+            },
+            {
+                "config": {"BLOCK": 128, "num_warps": 8, "num_stages": 1},
+                "python": ["4", "1", "1"],
+                "cpp": ["4L", "1L", "1L"],
+                "python_slow": ["4", "1", "1"],
+            },
+        ]
+        self.assertEqual(
+            PrecomputedGrid.find_candidate_index(
+                candidates, {"BLOCK": 128, "num_warps": 8, "num_stages": 1}
+            ),
+            1,
+        )
+
+    def test_relaxed_tier_returns_first_match(self):
+        # Candidates differing only in stage counts: the relaxed tier
+        # returns the first match (relaxed matches reuse the stored
+        # grid as-is).
+        def cand(stages, grid):
+            return {
+                "config": {
+                    "BLOCK": 128,
+                    "num_warps": 8,
+                    "num_stages": stages,
+                },
+                "python": [grid, "1", "1"],
+                "cpp": [f"{grid}L", "1L", "1L"],
+                "python_slow": [grid, "1", "1"],
+            }
+
+        candidates = [cand(2, "4"), cand(4, "8")]
+        self.assertEqual(
+            PrecomputedGrid.find_candidate_index(
+                candidates,
+                {"BLOCK": 128, "num_warps": 8, "num_stages": 1},
+            ),
+            0,
+        )
+
+    def test_relaxed_tier_accepts_identical_grids(self):
+        def cand(stages):
+            return {
+                "config": {
+                    "BLOCK": 128,
+                    "num_warps": 8,
+                    "num_stages": stages,
+                },
+                "python": ["4", "1", "1"],
+                "cpp": ["4L", "1L", "1L"],
+                "python_slow": ["4", "1", "1"],
+            }
+
+        self.assertEqual(
+            PrecomputedGrid.find_candidate_index(
+                [cand(2), cand(4)],
+                {"BLOCK": 128, "num_warps": 8, "num_stages": 1},
+            ),
+            0,
+        )
+
+    def test_make_launchers_retries_with_precomputed_grid(self):
+        # Drive _make_launchers -> compile_by_disabling_pipelining with
+        # a fake compile result whose make_launcher goes through
+        # GridExpr.from_meta (with a real triton.Config, so the
+        # config_to_dict conversion in from_meta runs).
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from torch._inductor.runtime.triton_compat import OutOfResources, triton
+        from torch._inductor.runtime.triton_heuristics import config_to_dict, GridExpr
+
+        chosen = triton.Config({"BLOCK": 128}, num_warps=8, num_stages=3)
+        other = triton.Config({"BLOCK": 128}, num_warps=4, num_stages=3)
+
+        def cand(cfg, grid):
+            return {
+                "config": config_to_dict(cfg),
+                "python": [grid, "1", "1"],
+                "cpp": [f"{grid}L", "1L", "1L"],
+                "python_slow": [grid, "1", "1"],
+            }
+
+        inductor_meta = {
+            "grid_type": "PrecomputedGrid",
+            "precomputed_grids": [cand(other, "9"), cand(chosen, "4")],
+        }
+
+        class FakeResult:
+            def __init__(self, cfg):
+                self.config = cfg
+
+            def make_launcher(self):
+                if self.config.num_stages > 1:
+                    raise OutOfResources(999, 1, "shared memory")
+                grid = GridExpr.from_meta(inductor_meta, self.config)
+                return (grid.x_grid, grid.y_grid, grid.z_grid)
+
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.configs = [chosen]
+        autotuner.compile_results = [FakeResult(chosen)]
+        autotuner.launchers = []
+        autotuner.inductor_meta = inductor_meta
+        autotuner.device_props = SimpleNamespace(type="cuda", index=0)
+        autotuner._ensure_kernel_loaded = mock.Mock()
+        autotuner.get_device_interface = mock.Mock()
+        autotuner._precompile_config = mock.Mock(
+            side_effect=lambda cfg: FakeResult(cfg)
+        )
+        with mock.patch(
+            "torch._dynamo.device_interface.DeviceGuard", return_value=nullcontext()
+        ):
+            autotuner._make_launchers()
+        self.assertEqual(autotuner.launchers, [("4", "1", "1")])
+        retried = autotuner._precompile_config.call_args.args[0]
+        self.assertEqual(retried.num_stages, 1)
+
+    def test_relaxed_tier_requires_same_keys(self):
+        # A candidate omitting NUM_STAGES must not match a retried
+        # lookup that carries it: the retry only changes values, never
+        # keys, so relaxed matches must carry exactly the same keys.
+        candidates = [
+            {
+                "config": {"BLOCK": 128, "num_warps": 8, "num_stages": 3},
+                "python": ["4", "1", "1"],
+                "cpp": ["4L", "1L", "1L"],
+                "python_slow": ["4", "1", "1"],
+            }
+        ]
+        with self.assertRaisesRegex(RuntimeError, "Precomputed grid not found"):
+            PrecomputedGrid.find_candidate_index(
+                candidates,
+                {
+                    "BLOCK": 128,
+                    "NUM_STAGES": 1,
+                    "num_warps": 8,
+                    "num_stages": 1,
+                },
+            )
+
+    def test_relaxed_tier_requires_lookup_num_stages_one(self):
+        # The relaxed tier is gated on the lookup num_stages being 1
+        # (the retry value): a num_stages=2 lookup whose only mismatch
+        # is num_stages must not relax onto a num_stages=3 candidate.
+        candidates = [
+            {
+                "config": {"BLOCK": 128, "num_warps": 8, "num_stages": 3},
+                "python": ["4", "1", "1"],
+                "cpp": ["4L", "1L", "1L"],
+                "python_slow": ["4", "1", "1"],
+            }
+        ]
+        with self.assertRaisesRegex(RuntimeError, "Precomputed grid not found"):
+            PrecomputedGrid.find_candidate_index(
+                candidates, {"BLOCK": 128, "num_warps": 8, "num_stages": 2}
+            )
+
+    def test_generate_declared_num_stages_constexpr_raises(self):
+        # PrecomputedGrid.generate forwards declared_constexpr_names
+        # from inductor_meta, so a declared num_stages constexpr
+        # disables grid reuse for the retried config.
+        grid = self._make_grid(declared_constexpr_names=["num_stages"])
+        with self.assertRaisesRegex(RuntimeError, "Precomputed grid not found"):
+            grid.generate({"BLOCK": 128, "num_warps": 8, "num_stages": 1})
+
+    def test_aoti_header_declared_num_stages_constexpr_raises(self):
+        # One lazy path (generate_aoti_kernel_config_header) forwards
+        # declared_constexpr_names the same way.
+        from torch._inductor.codecache import CudaKernelParamCache
+        from torch._inductor.codegen.cpp_wrapper_gpu import (
+            generate_aoti_kernel_config_header,
+        )
+
+        params = self._aoti_params({"BLOCK": 128, "num_warps": 8, "num_stages": 1})
+        params["inductor_meta"]["declared_constexpr_names"] = ["num_stages"]
+        with (
+            patch.object(CudaKernelParamCache, "get", return_value=params),
+            self.assertRaisesRegex(RuntimeError, "Precomputed grid not found"),
+        ):
+            generate_aoti_kernel_config_header(["fake_kernel"])
+
+    def test_declared_num_stages_constexpr_disables_relaxation(self):
+        # If the kernel declares num_stages as a constexpr, the retried
+        # kernel itself differs, so no stored grid is reused.
+        candidates = self._candidates()
+        self.assertEqual(
+            PrecomputedGrid.find_candidate_index(
+                candidates, {"BLOCK": 128, "num_warps": 8, "num_stages": 1}
+            ),
+            1,
+        )
+        with self.assertRaisesRegex(RuntimeError, "Precomputed grid not found"):
+            PrecomputedGrid.find_candidate_index(
+                candidates,
+                {"BLOCK": 128, "num_warps": 8, "num_stages": 1},
+                declared_constexpr_names=["num_stages"],
+            )
+
+    def _fake_lazy_autotuner(self, config, candidates):
+        from types import SimpleNamespace
+
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.triton_meta = {}
+        autotuner.inductor_meta = {
+            "grid_type": "PrecomputedGrid",
+            "precomputed_grids": candidates,
+        }
+        autotuner.launchers = [SimpleNamespace(config=config)]
+        autotuner.run = MagicMock()
+        return autotuner
+
+    def test_lazy_autotune_selects_relaxed_candidate(self):
+        from torch._inductor.codecache import (
+            CudaKernelParamCache,
+            get_cpp_wrapper_cubin_path_name,
+        )
+        from torch._inductor.runtime.triton_compat import triton
+        from torch._inductor.runtime.triton_heuristics import config_to_dict
+        from torch._inductor.runtime.triton_lazy_compile import (
+            run_triton_kernel_with_autotune,
+        )
+
+        chosen = triton.Config({"BLOCK": 128}, num_warps=8, num_stages=3)
+        autotuner = self._fake_lazy_autotuner(
+            triton.Config({"BLOCK": 128}, num_warps=8, num_stages=1),
+            [
+                {
+                    "config": config_to_dict(chosen),
+                    "python": ["4", "1", "1"],
+                    "cpp": ["4L", "1L", "1L"],
+                    "python_slow": ["4", "1", "1"],
+                }
+            ],
+        )
+        cached = {
+            get_cpp_wrapper_cubin_path_name(): "/tmp/fake.cubin",
+            "mangled_name": "fake_mangled",
+            "num_warps": 8,
+            "shared_mem": 0,
+        }
+        with patch.object(CudaKernelParamCache, "get", return_value=cached):
+            result = run_triton_kernel_with_autotune(
+                {"fake_kernel": autotuner}, "fake_kernel", None, []
+            )
+        self.assertEqual(result.config_index, 0)
+
+    def test_lazy_autotune_raises_on_unmatched_config(self):
+        from torch._inductor.codecache import (
+            CudaKernelParamCache,
+            get_cpp_wrapper_cubin_path_name,
+        )
+        from torch._inductor.runtime.triton_compat import triton
+        from torch._inductor.runtime.triton_lazy_compile import (
+            run_triton_kernel_with_autotune,
+        )
+
+        autotuner = self._fake_lazy_autotuner(
+            triton.Config({"BLOCK": 64}, num_warps=8, num_stages=1),
+            self._candidates(),
+        )
+        cached = {
+            get_cpp_wrapper_cubin_path_name(): "/tmp/fake.cubin",
+            "mangled_name": "fake_mangled",
+            "num_warps": 8,
+            "shared_mem": 0,
+        }
+        with (
+            patch.object(CudaKernelParamCache, "get", return_value=cached),
+            self.assertRaisesRegex(RuntimeError, "Precomputed grid not found"),
+        ):
+            run_triton_kernel_with_autotune(
+                {"fake_kernel": autotuner}, "fake_kernel", None, []
+            )
+
+    def test_lazy_autotune_declared_num_stages_constexpr_raises(self):
+        # run_triton_kernel_with_autotune forwards
+        # declared_constexpr_names, so a declared num_stages constexpr
+        # disables grid reuse for the retried config on the lazy path.
+        from torch._inductor.codecache import (
+            CudaKernelParamCache,
+            get_cpp_wrapper_cubin_path_name,
+        )
+        from torch._inductor.runtime.triton_compat import triton
+        from torch._inductor.runtime.triton_lazy_compile import (
+            run_triton_kernel_with_autotune,
+        )
+
+        autotuner = self._fake_lazy_autotuner(
+            triton.Config({"BLOCK": 128}, num_warps=8, num_stages=1),
+            self._candidates(),
+        )
+        autotuner.inductor_meta["declared_constexpr_names"] = ["num_stages"]
+        cached = {
+            get_cpp_wrapper_cubin_path_name(): "/tmp/fake.cubin",
+            "mangled_name": "fake_mangled",
+            "num_warps": 8,
+            "shared_mem": 0,
+        }
+        with (
+            patch.object(CudaKernelParamCache, "get", return_value=cached),
+            self.assertRaisesRegex(RuntimeError, "Precomputed grid not found"),
+        ):
+            run_triton_kernel_with_autotune(
+                {"fake_kernel": autotuner}, "fake_kernel", None, []
+            )
+
+    def test_lazy_grid_default_throws(self):
+        from torch._inductor.codegen.cpp_wrapper_gpu import DeferredTritonCallWrapper
+        from torch._inductor.utils import IndentedBuffer
+
+        wrapper = object.__new__(DeferredTritonCallWrapper)
+        wrapper.kernel_name = "fake_kernel"
+        wrapper.inductor_meta = {
+            "grid_type": "PrecomputedGrid",
+            "precomputed_grids": self._candidates(),
+            "extra_launcher_args": [],
+        }
+        prefix = IndentedBuffer()
+        wrapper._generate_lazy_grid(prefix)
+        code = prefix.getvalue()
+        self.assertIn("case 0:", code)
+        self.assertIn("case 1:", code)
+        self.assertIn(
+            'default: throw std::runtime_error("Invalid config_index " '
+            '+ std::to_string(fake_kernel_result.config_index) '
+            '+ " for kernel fake_kernel");',
+            code,
+        )
+
+    def test_still_rejects_different_block_sizes(self):
+        with self.assertRaisesRegex(RuntimeError, "Precomputed grid not found"):
+            PrecomputedGrid.find_candidate_index(
+                self._candidates(), {"BLOCK": 64, "num_warps": 8, "num_stages": 2}
+            )
+        grid = self._make_grid()
+        with self.assertRaisesRegex(RuntimeError, "Precomputed grid not found"):
+            grid.generate({"BLOCK": 64, "num_warps": 8, "num_stages": 2})
+
+    def _aoti_params(self, config):
+        from torch._inductor.codecache import get_cpp_wrapper_cubin_path_name
+
+        return {
+            get_cpp_wrapper_cubin_path_name(): "/tmp/fake_kernel.cubin",
+            "mangled_name": "fake_kernel_mangled",
+            "num_warps": 8,
+            "shared_mem": 1024,
+            "config": config,
+            "inductor_meta": {
+                "grid_type": "PrecomputedGrid",
+                "precomputed_grids": self._candidates(),
+            },
+        }
+
+    def test_aoti_config_header_matches_pipelining_disabled_config(self):
+        # The AOTI lazy path must select the num_warps=8 candidate (index
+        # 1) for a num_stages=1 retry config instead of CONFIG_INDEX=-1.
+        from torch._inductor.codecache import CudaKernelParamCache
+        from torch._inductor.codegen.cpp_wrapper_gpu import (
+            generate_aoti_kernel_config_header,
+        )
+
+        params = self._aoti_params({"BLOCK": 128, "num_warps": 8, "num_stages": 1})
+        with patch.object(CudaKernelParamCache, "get", return_value=params):
+            header = generate_aoti_kernel_config_header(["fake_kernel"])
+        self.assertIn("#define FAKE_KERNEL_CONFIG_INDEX 1", header)
+
+    def test_aoti_config_header_rejects_unmatched_config(self):
+        from torch._inductor.codecache import CudaKernelParamCache
+        from torch._inductor.codegen.cpp_wrapper_gpu import (
+            generate_aoti_kernel_config_header,
+        )
+
+        params = self._aoti_params({"BLOCK": 64, "num_warps": 8, "num_stages": 2})
+        with (
+            patch.object(CudaKernelParamCache, "get", return_value=params),
+            self.assertRaisesRegex(RuntimeError, "Precomputed grid not found"),
+        ):
+            generate_aoti_kernel_config_header(["fake_kernel"])
 
 
 class TestGrid2DWithYZOverflowZeroYnumel(TestCase):

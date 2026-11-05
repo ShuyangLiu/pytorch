@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 from collections import namedtuple
+from collections.abc import Collection
 from typing import (
     Any,
     cast,
@@ -1191,6 +1192,8 @@ class CachingAutotuner(KernelInterface):
     def compile_by_disabling_pipelining(self, config):
         self._ensure_kernel_loaded()
         cfg = copy.deepcopy(config)
+        # PrecomputedGrid.find_candidate_index relies on this lowering
+        # num_stages to exactly 1.
         cfg.num_stages = 1
         if "NUM_STAGES" in cfg.kwargs:
             cfg.kwargs["NUM_STAGES"] = 1
@@ -5826,14 +5829,54 @@ class FixedGrid(GridExpr):
 
 
 class PrecomputedGrid(GridExpr):
-    def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
-        for candidate in self.inductor_meta["precomputed_grids"]:
-            if all(meta.get(k) == v for k, v in candidate["config"].items()):
-                self.x_grid, self.y_grid, self.z_grid = candidate[self.mode]
-                return
-        raise AssertionError(
-            f"Precomputed grid not found for {meta} in {self.inductor_meta['precomputed_grids']}"
+    @staticmethod
+    def find_candidate_index(
+        precomputed_grids: list[dict[str, Any]],
+        config: dict[str, Any],
+        *,
+        declared_constexpr_names: Collection[str] = (),
+    ) -> int:
+        """Return the index of the candidate matching `config`.
+
+        First, the first candidate whose keys are a subset of `config`
+        with equal values wins (the producer sorts candidates by kwarg
+        count, most first). For the pipelining-disabled retry only
+        (lookup `num_stages` is 1 and the kernel does not declare
+        `num_stages` as a constexpr), a candidate with identical keys
+        whose values differ only in `num_stages` also matches; its grid
+        is reused as-is. Raises RuntimeError when nothing matches.
+        """
+        for idx, candidate in enumerate(precomputed_grids):
+            if all(
+                config.get(k) == v for k, v in candidate["config"].items()
+            ):
+                return idx
+        if config.get("num_stages") == 1 and (
+            "num_stages" not in declared_constexpr_names
+        ):
+            for idx, candidate in enumerate(precomputed_grids):
+                candidate_config = candidate["config"]
+                if candidate_config.keys() != config.keys():
+                    continue
+                if all(
+                    config.get(k) == v or k == "num_stages"
+                    for k, v in candidate_config.items()
+                ):
+                    return idx
+        raise RuntimeError(
+            f"Precomputed grid not found for {config} in {precomputed_grids}"
         )
+
+    def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
+        candidate_index = self.find_candidate_index(
+            self.inductor_meta["precomputed_grids"],
+            meta,
+            declared_constexpr_names=self.inductor_meta.get(
+                "declared_constexpr_names", ()
+            ),
+        )
+        candidate = self.inductor_meta["precomputed_grids"][candidate_index]
+        self.x_grid, self.y_grid, self.z_grid = candidate[self.mode]
 
 
 class ComboKernelGrid(GridExpr):
