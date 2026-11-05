@@ -91,6 +91,7 @@ from torch.testing._comparison import (
     Pair,
     TensorLikePair,
 )
+from torch.testing._internal import tci
 from torch.testing._internal.common_dtype import get_all_dtypes
 from torch.utils._import_utils import _check_module_exists
 import torch.utils._pytree as pytree
@@ -3814,6 +3815,9 @@ class NoTest:
     __test__ = False
 
 
+# The root of every test's spec (tci): DEFAULT's platforms on every PR and merge.
+@tci.when(tci.pull, tci.trunk)
+@tci.runs_on(tci.DEFAULT)
 class TestCase(expecttest.TestCase):
     # NOTE: "precision" lets classes and generated tests set minimum
     # atol values when comparing tensors. Used by @precisionOverride and @toleranceOverride, for

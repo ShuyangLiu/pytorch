@@ -119,6 +119,16 @@ def pytest_addoption(parser: Parser) -> None:
         "without it are unaffected. Layered on top of `-m multigpu` so a "
         "larger-runner config can run just the >2-GPU distributed tests.",
     )
+    parser.addoption(
+        "--list-platforms",
+        action="store_true",
+        help="print the platforms each collected test runs on, and when (tci)",
+    )
+    parser.addoption(
+        "--list-platforms-json",
+        action="store_true",
+        help="print what --list-platforms prints, as JSON",
+    )
     shard_addoptions(parser)
 
 
@@ -186,6 +196,15 @@ def pytest_configure(config: Config) -> None:
             MultiGpuMinFilterPlugin(config.getoption("multigpu_min_gpus")),
             "multigpu_min_filter_plugin",
         )
+
+
+def pytest_cmdline_main(config: Config) -> int | None:
+    if not (config.option.list_platforms or config.option.list_platforms_json):
+        return None
+    # Imported here: main's tests sometimes run against an older nightly.
+    from torch.testing._internal.tci import plugin
+
+    return plugin.list_platforms(config)
 
 
 def pytest_unconfigure(config: Config) -> None:

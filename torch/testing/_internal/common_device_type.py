@@ -19,6 +19,7 @@ from typing_extensions import override, ParamSpec
 import torch
 from torch._inductor.utils import GPU_TYPES
 from torch._utils import _is_privateuse1_backend_available
+from torch.testing._internal import tci
 from torch.testing._internal.common_cuda import (
     _get_torch_cuda_version,
     _get_torch_hipblaslt_version,
@@ -1326,8 +1327,9 @@ def instantiate_device_type_tests(
                     )
                 else:
                     device_type_test_class.instantiate_test(name, copy.deepcopy(test))
-            # Ports non-test member. Setup / teardown have already been handled above
-            elif name not in device_type_test_class.__dict__:
+            # Ports non-test member. Setup / teardown have already been handled above,
+            # and tci statements already fold in from generic_test_class, a base.
+            elif name not in device_type_test_class.__dict__ and name != tci.ATTR:
                 # Copy the raw attribute: getattr would unwrap staticmethod and
                 # classmethod descriptors.
                 nontest = generic_test_class.__dict__[name]
